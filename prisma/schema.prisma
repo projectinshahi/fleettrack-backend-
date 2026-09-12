@@ -74,6 +74,11 @@ model VehicleLocationHistory {
 
   @@index([vehicleId])
   @@index([createdAt])
+  // Serves "WHERE vehicleId = ? ORDER BY createdAt DESC" — the latest-fix lookup in
+  // TrackingService and the 1-hour history window in VehiclesService. With only the two
+  // single-column indexes above, Postgres scanned createdAt backwards and filtered on
+  // vehicleId, discarding up to 1,077 rows to return 1.
+  @@index([vehicleId, createdAt])
 }
 
 enum Role {

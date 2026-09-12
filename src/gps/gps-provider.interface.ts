@@ -56,4 +56,17 @@ export interface GpsProvider {
   getVehicles(): Promise<NormalizedVehicle[]>;
   /** Latest positions for all vehicles (bulk). */
   getLatestPositions(): Promise<NormalizedPosition[]>;
+  /**
+   * Inventory the adapter ALREADY holds in memory — makes no API call.
+   *
+   * Only a provider with a SEPARATE inventory endpoint implements this. Transight's
+   * get_all_vehicles lists vehicles that get_all_vehicles_last_data may omit, so the
+   * sync needs the full list to create rows for devices that have never sent a fix.
+   *
+   * Optional on purpose: AiroTrack's inventory IS its positions (its getVehicles() is
+   * getLatestPositions() plus a map — a second full HTTP GET), so it deliberately does
+   * NOT implement this and the sync's gap-fill pass becomes a no-op for it. That is how
+   * a provider opts out structurally, instead of the service branching on provider name.
+   */
+  cachedVehicles?(): NormalizedVehicle[];
 }

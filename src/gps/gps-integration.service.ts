@@ -20,6 +20,16 @@ export class GpsIntegrationService implements OnModuleInit {
   private readonly logger = new Logger(GpsIntegrationService.name);
   private readonly adapters = new Map<GpsProviderName, GpsProvider>();
 
+  /**
+   * Short-lived cache of the active-provider rows. The sync cron reads this every 60s
+   * while the configuration itself is admin-edited and changes rarely, so the read was
+   * ~1,440 queries/day for a two-row table. Cleared immediately on `upsert()` so an
+   * admin change still takes effect on the very next tick, never after a TTL.
+   */
+  private providerCache: { rows: GpsIntegration[]; fetchedAt: number } | null =
+    null;
+  private static readonly PROVIDER_CACHE_TTL_MS = 120 * 1000;
+
   constructor(private prisma: PrismaService) {}
 
   async onModuleInit(): Promise<void> {
@@ -70,9 +80,20 @@ export class GpsIntegrationService implements OnModuleInit {
   async getActiveProviders(): Promise<
     { config: GpsIntegration; provider: GpsProvider }[]
   > {
-    const rows = await this.prisma.gpsIntegration.findMany({
-      where: { active: true },
-    });
+    const now = Date.now();
+    if (
+      !this.providerCache ||
+      now - this.providerCache.fetchedAt >
+        GpsIntegrationService.PROVIDER_CACHE_TTL_MS
+    ) {
+      this.providerCache = {
+        rows: await this.prisma.gpsIntegration.findMany({
+          where: { active: true },
+        }),
+        fetchedAt: now,
+      };
+    }
+    const rows = this.providerCache.rows;
 
     const out: { config: GpsIntegration; provider: GpsProvider }[] = [];
     for (const row of rows) {
@@ -109,10 +130,26 @@ export class GpsIntegrationService implements OnModuleInit {
     provider: GpsProviderName,
     error?: string | null,
   ): Promise<void> {
+    const lastSyncedAt = new Date();
     await this.prisma.gpsIntegration
       .update({
         where: { provider },
-        data: { lastSyncedAt: new Date(), lastError: error ?? null },
+        data: { lastSyncedAt, lastError: error ?? null },
+      })
+      .then(() => {
+        // Keep the cached row in step with the write. TrackingService decides whether a
+        // provider is due from `config.lastSyncedAt`, so a cached row still holding the
+        // PREVIOUS sync time would report the provider due again on the next tick and
+        // poll it more often than its configured interval — which is exactly what the
+        // provider rate limits forbid. Patched only on a successful write, so a failed
+        // one behaves as it always did (the DB kept the old value too).
+        const cached = this.providerCache?.rows.find(
+          (r) => r.provider === provider,
+        );
+        if (cached) {
+          cached.lastSyncedAt = lastSyncedAt;
+          cached.lastError = error ?? null;
+        }
       })
       .catch(() => undefined);
   }
@@ -140,6 +177,10 @@ export class GpsIntegrationService implements OnModuleInit {
       update: dto.credential ? { ...base, credential: dto.credential } : base,
       create: { provider, ...base, credential: dto.credential ?? null },
     });
+
+    // Admin just changed provider config — drop the cache so the next sync tick reads
+    // the new row instead of waiting out the TTL. Response shape is unchanged.
+    this.providerCache = null;
 
     return { success: true, integration: this.mask(row) };
   }

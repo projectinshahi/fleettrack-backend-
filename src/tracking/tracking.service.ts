@@ -5,7 +5,11 @@ import { Vehicle, TripStatus, VehicleStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { TrackingGateway } from './tracking.gateway';
 import { GpsIntegrationService } from '../gps/gps-integration.service';
-import { NormalizedPosition } from '../gps/gps-provider.interface';
+import {
+  GpsProvider,
+  NormalizedPosition,
+  NormalizedVehicle,
+} from '../gps/gps-provider.interface';
 import {
   isPositionFresh,
   positionAgeMs,
@@ -77,6 +81,13 @@ export class TrackingService {
   // Reentrancy guard — a single poller. If a tick is still running (slow provider
   // or DB), the next @Cron tick is skipped rather than starting a second sync.
   private isSyncing = false;
+
+  // Active trip ids grouped by vehicle, valid for ONE sync cycle only (cleared in the
+  // `finally` of syncVehicles). Breadcrumb recording used to ask the Trip table for a
+  // vehicle's active trips once per saved history point; this holds the answer for the
+  // whole tick instead. Loaded lazily, so a tick in which nothing moved still costs zero
+  // trip queries — exactly as before.
+  private activeTripsByVehicle: Map<string, string[]> | null = null;
 
   constructor(
     private prisma: PrismaService,
@@ -178,6 +189,31 @@ export class TrackingService {
               )}m)`,
           );
 
+          // Gap-fill from the inventory the adapter already cached while fetching those
+          // positions. AFTER the position loop on purpose: every vehicle that HAS a fix is
+          // already upserted with real telemetry, so this pass finds it and does nothing —
+          // no placeholder is ever written and then overwritten. Its own try/catch so a
+          // failure here cannot discard the positions we just synced or stamp an error on
+          // a provider whose position sync succeeded.
+          try {
+            const created = await this.syncInventory(provider);
+            if (created) {
+              this.logger.log(
+                `Provider ${config.provider}: created ${created} inventory-only ` +
+                  `vehicle(s) that the provider lists but has never sent a position for`,
+              );
+            }
+          } catch (inventoryError) {
+            const msg =
+              inventoryError instanceof Error
+                ? inventoryError.message
+                : String(inventoryError);
+            this.logger.warn(
+              `Inventory gap-fill for ${config.provider} failed (${msg}) — positions ` +
+                `were synced normally; the next poll retries`,
+            );
+          }
+
           await this.gpsIntegration.markSynced(config.provider, null);
         } catch (providerError) {
           if (this.isTransientDbError(providerError)) {
@@ -205,7 +241,111 @@ export class TrackingService {
       );
     } finally {
       this.isSyncing = false;
+      // End of the sync cycle — drop the per-cycle active-trip snapshot so the next
+      // tick reloads it and never acts on a stale trip set.
+      this.activeTripsByVehicle = null;
     }
+  }
+
+  /**
+   * Resolve ONE provider identity to an existing Vehicle row, or null.
+   *
+   * Provider id first, then IMEI — and an IMEI hit RE-KEYS the row it found rather than
+   * letting a second row be minted under the new key. Transight positions carry no
+   * vehicle_id, so the adapter substitutes the IMEI whenever its inventory cache is cold;
+   * once inventory loads the same truck arrives keyed by vehicle_id, and
+   * @@unique([providerName, providerVehicleId]) treats that as a brand new vehicle. That
+   * is exactly how 12 duplicate rows appeared on 2026-08-14.
+   *
+   * This is deliberately the ONLY path to the vehicle table for both the position loop and
+   * the inventory gap-fill. A second, parallel lookup is how duplicates get back in —
+   * neither unique constraint can stop them: @@unique([clientId, vehicleNumber]) is inert
+   * because clientId is NULL for synced inventory (Postgres treats NULLs as distinct), and
+   * @@unique([providerName, providerVehicleId]) is inert precisely when two rows are keyed
+   * by different identities for the same device.
+   */
+  private async findExistingVehicle(v: NormalizedVehicle) {
+    const byProviderId = await this.prisma.vehicle.findFirst({
+      where: { providerName: v.providerName, providerVehicleId: v.providerVehicleId },
+    });
+    if (byProviderId || !v.imei) return byProviderId;
+
+    const byImei = await this.prisma.vehicle.findFirst({
+      where: { providerName: v.providerName, imei: v.imei },
+    });
+    if (!byImei) return null;
+
+    this.logger.log(
+      `Re-keying ${v.vehicleNumber} (${v.providerName}) from ` +
+        `providerVehicleId=${byImei.providerVehicleId} to ${v.providerVehicleId} ` +
+        `via IMEI — same device, avoided a duplicate row`,
+    );
+    return this.prisma.vehicle.update({
+      where: { id: byImei.id },
+      data: { providerVehicleId: v.providerVehicleId },
+    });
+  }
+
+  /**
+   * Create rows for vehicles the provider LISTS but that have never sent a position.
+   *
+   * Transight exposes two endpoints and they disagree: get_all_vehicles returns the full
+   * fleet while get_all_vehicles_last_data returns only devices with a recent fix (20 vs
+   * 18 on 2026-09-11). The sync was position-first, so a vehicle that had never reported
+   * simply never got a row — it was invisible in FleetTrack while plainly present at the
+   * provider.
+   *
+   * Reads ONLY the inventory the adapter already cached while fetching positions, so this
+   * makes NO API call and cannot touch the 100/day get_all_vehicles cap. A provider whose
+   * inventory IS its positions (AiroTrack) does not implement cachedVehicles(), so the
+   * loop body never runs for it.
+   *
+   * CREATE-ONLY by design: positions own telemetry, inventory only fills gaps. Existing
+   * rows are never updated here and never deleted — an absent or partial inventory
+   * response must never be read as a delete signal.
+   */
+  private async syncInventory(provider: GpsProvider): Promise<number> {
+    let created = 0;
+
+    for (const v of provider.cachedVehicles?.() ?? []) {
+      if (await this.findExistingVehicle(v)) continue;
+
+      await this.prisma.vehicle.create({
+        data: {
+          vehicleName: v.vehicleNumber,
+          vehicleNumber: v.vehicleNumber,
+          // imei may be null; the column is not nullable, so fall back to the plate.
+          gpsDeviceId: v.gpsDeviceId ?? v.vehicleNumber,
+          providerName: v.providerName,
+          providerVehicleId: v.providerVehicleId,
+          imei: v.imei ?? null,
+          driverName: 'Unknown Driver',
+          clientId: null, // unassigned global inventory — never auto-assigned
+          // This device has NEVER reported a fix. latitude/longitude/speed are left to the
+          // column defaults (0/0/0) rather than invented; 0,0 is already this codebase's
+          // "no usable fix" sentinel (isValidCoord rejects it, and so does the frontend's
+          // isValidCoordinate, so no marker is plotted). status and isOnline are set
+          // EXPLICITLY because the schema defaults (IDLE / true) would advertise a vehicle
+          // we have never heard from as online. Both timestamps stay null: writing
+          // new Date() into lastProviderUpdate would forge freshness out of nothing.
+          status: 'OFFLINE',
+          isOnline: false,
+          lastProviderUpdate: null,
+          lastSeenAt: null,
+        },
+      });
+      created++;
+
+      this.logger.log(
+        `New inventory-only vehicle ${v.vehicleNumber} (${v.providerName}): listed by ` +
+          `the provider but has never sent a position — created OFFLINE with no coordinates`,
+      );
+      // Deliberately no emitVehicleUpdate: broadcasting a vehicle with no position to
+      // every connected live map is noise, and no client can render it usefully.
+      // Deliberately no recordHistoryAndBreadcrumbs: there is no position to record.
+    }
+
+    return created;
   }
 
   /**
@@ -237,37 +377,7 @@ export class TrackingService {
 
     const status = this.deriveStatus(pos.ignition, pos.speed, fresh);
 
-    let existing = await this.prisma.vehicle.findFirst({
-      where: {
-        providerName: pos.providerName,
-        providerVehicleId: pos.providerVehicleId,
-      },
-    });
-
-    // Same physical device, different provider key. Transight positions carry no
-    // vehicle_id, so the adapter falls back to the IMEI whenever its inventory cache is
-    // cold (fresh container, or the 100/day inventory limit refusing the call). Once the
-    // inventory loads, the SAME vehicle starts arriving keyed by vehicle_id — and
-    // @@unique([providerName, providerVehicleId]) treated that as a brand new vehicle,
-    // silently creating a second row per truck. Matching on the IMEI re-keys the row we
-    // already have instead of duplicating it.
-    if (!existing && pos.imei) {
-      existing = await this.prisma.vehicle.findFirst({
-        where: { providerName: pos.providerName, imei: pos.imei },
-      });
-
-      if (existing) {
-        this.logger.log(
-          `Re-keying ${pos.vehicleNumber} (${pos.providerName}) from ` +
-            `providerVehicleId=${existing.providerVehicleId} to ${pos.providerVehicleId} ` +
-            `via IMEI — same device, avoided a duplicate row`,
-        );
-        existing = await this.prisma.vehicle.update({
-          where: { id: existing.id },
-          data: { providerVehicleId: pos.providerVehicleId },
-        });
-      }
-    }
+    const existing = await this.findExistingVehicle(pos);
 
     // Nothing matched by provider id OR by IMEI. If the identity we were given is itself a
     // fallback (Transight's inventory cache was empty, so the IMEI is standing in for a
@@ -452,8 +562,18 @@ export class TrackingService {
       );
 
       const now = Date.now();
+      // Only the columns the sweep below actually reads. The vehicle row that gets
+      // broadcast is the one `update()` returns further down (still the full row), so
+      // the socket payload is unchanged.
       const candidates = await this.prisma.vehicle.findMany({
         where: { isOnline: true },
+        select: {
+          id: true,
+          vehicleNumber: true,
+          providerName: true,
+          lastProviderUpdate: true,
+          lastSeenAt: true,
+        },
       });
 
       for (const vehicle of candidates) {
@@ -498,6 +618,41 @@ export class TrackingService {
   }
 
   /**
+   * Active trip ids for one vehicle, from a snapshot taken at most ONCE per sync cycle.
+   *
+   * The selection is unchanged — a trip counts when it is assigned to this vehicle and
+   * its status is in ACTIVE_TRIP_STATUSES — it is just resolved against one fleet-wide
+   * read instead of one query per saved history point. Measured on production: the Trip
+   * table was queried once for every VehicleLocationHistory row written (25,547 scans
+   * for 25,547 rows), every one of them returning nothing.
+   *
+   * Loaded lazily on the first breadcrumb of the cycle, so a tick in which no vehicle
+   * moved far enough to persist still issues zero trip queries, exactly as before.
+   */
+  private async activeTripIdsFor(vehicleId: string): Promise<string[]> {
+    if (!this.activeTripsByVehicle) {
+      const trips = await this.prisma.trip.findMany({
+        where: { status: { in: ACTIVE_TRIP_STATUSES } },
+        select: { id: true, vehicleId: true },
+      });
+
+      const byVehicle = new Map<string, string[]>();
+      for (const trip of trips) {
+        // vehicleId is nullable (an unassigned trip); such a trip matched no vehicle
+        // under the old per-vehicle WHERE either, so it is skipped here too.
+        if (!trip.vehicleId) continue;
+        const existing = byVehicle.get(trip.vehicleId);
+        if (existing) existing.push(trip.id);
+        else byVehicle.set(trip.vehicleId, [trip.id]);
+      }
+
+      this.activeTripsByVehicle = byVehicle;
+    }
+
+    return this.activeTripsByVehicle.get(vehicleId) ?? [];
+  }
+
+  /**
    * Append a GPS breadcrumb to every trip this vehicle is actively running, so a
    * completed trip can later replay its real travelled route. Called only when the
    * vehicle has moved far enough to persist (reuses the location-history filter).
@@ -507,16 +662,13 @@ export class TrackingService {
     point: { lat: number; lng: number; speed: number; heading: number },
   ) {
     try {
-      const activeTrips = await this.prisma.trip.findMany({
-        where: { vehicleId, status: { in: ACTIVE_TRIP_STATUSES } },
-        select: { id: true },
-      });
+      const activeTripIds = await this.activeTripIdsFor(vehicleId);
 
-      if (activeTrips.length === 0) return;
+      if (activeTripIds.length === 0) return;
 
       await this.prisma.tripBreadcrumb.createMany({
-        data: activeTrips.map((trip) => ({
-          tripId: trip.id,
+        data: activeTripIds.map((tripId) => ({
+          tripId,
           latitude: point.lat,
           longitude: point.lng,
           speed: point.speed,

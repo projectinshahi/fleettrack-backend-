@@ -1,5 +1,8 @@
 import { TrackingService } from './tracking.service';
-import { NormalizedPosition } from '../gps/gps-provider.interface';
+import {
+  NormalizedPosition,
+  NormalizedVehicle,
+} from '../gps/gps-provider.interface';
 
 /**
  * Vehicle identity resolution during a provider sync.
@@ -76,17 +79,30 @@ function makeService(
   positions: NormalizedPosition[],
   providerEnum = 'TRANSIGHT',
   pollIntervalSec = 300,
+  // Inventory the adapter would have cached. Defaults to [] so every pre-existing test
+  // exercises the position path exactly as before.
+  inventory: NormalizedVehicle[] = [],
+  // AiroTrack-shaped providers do NOT implement cachedVehicles at all — that absence is
+  // how they opt out of the gap-fill, so it has to be expressible here.
+  opts: { withCachedVehicles?: boolean } = {},
 ) {
   const gateway: any = { emitVehicleUpdate: jest.fn() };
+  const getVehicles = jest.fn(async () => inventory);
+  const providerStub: any = {
+    name: providerEnum.toLowerCase(),
+    getLatestPositions: async () => positions,
+    // Pinning this as a spy is what proves the gap-fill never spends a get_all_vehicles
+    // call — the Transight inventory endpoint is capped at 100/day.
+    getVehicles,
+  };
+  if (opts.withCachedVehicles !== false) {
+    providerStub.cachedVehicles = () => inventory;
+  }
   const gpsIntegration: any = {
     getActiveProviders: jest.fn(async () => [
       {
         config: { provider: providerEnum, pollIntervalSec, lastSyncedAt: null },
-        provider: {
-          name: providerEnum.toLowerCase(),
-          getLatestPositions: async () => positions,
-          getVehicles: async () => [],
-        },
+        provider: providerStub,
       },
     ]),
     markSynced: jest.fn(async () => undefined),
@@ -94,6 +110,7 @@ function makeService(
   return {
     service: new TrackingService(store.prisma, gateway, gpsIntegration),
     gateway,
+    getVehicles,
   };
 }
 
@@ -301,5 +318,194 @@ describe('TrackingService vehicle identity resolution', () => {
     expect(store.history.length).toBeGreaterThan(0);
     // every history point belongs to the one surviving vehicle
     expect(store.history.every((h) => h.vehicleId === id)).toBe(true);
+  });
+});
+
+/**
+ * Inventory-first gap-fill.
+ *
+ * Transight's two endpoints disagree: get_all_vehicles listed 20 vehicles while
+ * get_all_vehicles_last_data returned 18 (verified live 2026-09-11). The sync was
+ * position-first, so KL84D9877 (228282) and KL84E0577 (228085) — real vehicles that have
+ * simply never sent a fix — had no row at all. These tests pin the gap-fill that fixes
+ * that, and pin the two things it must never cost: an extra inventory API call, or a
+ * duplicate row.
+ */
+describe('TrackingService inventory-first gap-fill', () => {
+  /** A Transight inventory entry (NormalizedVehicle — no position fields at all). */
+  const invVehicle = (
+    over: Partial<NormalizedVehicle> = {},
+  ): NormalizedVehicle => ({
+    providerName: 'transight',
+    providerVehicleId: '228085',
+    vehicleNumber: 'KL84E0577',
+    imei: '862567078385031',
+    gpsDeviceId: '862567078385031',
+    ...over,
+  });
+
+  it('G1. creates a row for an inventory vehicle that has never sent a position', async () => {
+    const store = makeStore([]);
+    const { service, gateway } = makeService(store, [], 'TRANSIGHT', 300, [
+      invVehicle(),
+    ]);
+
+    await service.syncVehicles();
+
+    expect(store.rows).toHaveLength(1);
+    const row = store.rows[0];
+    expect(row.vehicleNumber).toBe('KL84E0577');
+    expect(row.providerVehicleId).toBe('228085');
+    expect(row.imei).toBe('862567078385031');
+    expect(row.status).toBe('OFFLINE');
+    expect(row.isOnline).toBe(false);
+    expect(row.clientId).toBeNull();
+    // No invented GPS: the create omits lat/lng entirely so the column defaults stand.
+    expect(row.latitude).toBeUndefined();
+    expect(row.longitude).toBeUndefined();
+    // No forged freshness.
+    expect(row.lastProviderUpdate).toBeNull();
+    expect(row.lastSeenAt).toBeNull();
+    // A vehicle with no position must not be broadcast to live maps.
+    expect(gateway.emitVehicleUpdate).not.toHaveBeenCalled();
+  });
+
+  it('G2. is idempotent — repeated syncs never create a second row', async () => {
+    const store = makeStore([]);
+    const inv = [invVehicle()];
+
+    await makeService(store, [], 'TRANSIGHT', 300, inv).service.syncVehicles();
+    await makeService(store, [], 'TRANSIGHT', 300, inv).service.syncVehicles();
+    await makeService(store, [], 'TRANSIGHT', 300, inv).service.syncVehicles();
+
+    expect(store.rows).toHaveLength(1);
+    expect(store.vehicle.create).toHaveBeenCalledTimes(1);
+  });
+
+  it('G3. a vehicle in BOTH inventory and positions gets ONE row, and the position wins', async () => {
+    const store = makeStore([]);
+    const { service } = makeService(
+      store,
+      [transightPos()], // 228068, speed 12, fresh
+      'TRANSIGHT',
+      300,
+      [invVehicle({ providerVehicleId: '228068', vehicleNumber: 'KL84D1577', imei: '860560066144082' })],
+    );
+
+    await service.syncVehicles();
+
+    expect(store.rows).toHaveLength(1);
+    expect(store.vehicle.create).toHaveBeenCalledTimes(1);
+    // Real telemetry, not the OFFLINE placeholder — the gap-fill must never overwrite.
+    expect(store.rows[0].speed).toBe(12);
+    expect(store.rows[0].status).not.toBe('OFFLINE');
+    expect(store.rows[0].isOnline).toBe(true);
+  });
+
+  it('G4. heals a legacy IMEI-keyed row instead of duplicating it', async () => {
+    // A row created during a cold-cache era, keyed by IMEI rather than vehicle_id.
+    const store = makeStore([
+      {
+        ...legitRow(),
+        id: 'legacy-row',
+        vehicleNumber: 'KL84E0577',
+        providerVehicleId: '862567078385031',
+        imei: '862567078385031',
+      },
+    ]);
+    const { service } = makeService(store, [], 'TRANSIGHT', 300, [invVehicle()]);
+
+    await service.syncVehicles();
+
+    expect(store.vehicle.create).not.toHaveBeenCalled();
+    expect(store.rows).toHaveLength(1);
+    expect(store.rows[0].id).toBe('legacy-row');
+    expect(store.rows[0].providerVehicleId).toBe('228085'); // re-keyed to the real id
+  });
+
+  it('G5. never spends a get_all_vehicles call — the 100/day cap is untouched', async () => {
+    const store = makeStore([]);
+    const { service, getVehicles } = makeService(store, [transightPos()], 'TRANSIGHT', 300, [
+      invVehicle(),
+    ]);
+
+    await service.syncVehicles();
+
+    // The gap-fill reads the adapter's already-cached list, never the network.
+    expect(getVehicles).not.toHaveBeenCalled();
+  });
+
+  it('G6. AiroTrack (no cachedVehicles method) is a complete no-op for the gap-fill', async () => {
+    const airoPos: NormalizedPosition = {
+      providerName: 'airotrack',
+      providerVehicleId: 'KL85B7233',
+      vehicleNumber: 'KL85B7233',
+      imei: null,
+      gpsDeviceId: 'KL85B7233',
+      latitude: 11.05,
+      longitude: 75.98,
+      speed: 30,
+      ignition: true,
+      batteryVoltage: 28.1,
+      charge: true,
+      providerTimestamp: new Date(),
+    };
+
+    const store = makeStore([]);
+    // withCachedVehicles:false models the real AiroTrackAdapter, which does not implement
+    // the optional method — its inventory IS its positions.
+    const { service, getVehicles } = makeService(
+      store,
+      [airoPos],
+      'AIROTRACK',
+      60,
+      [invVehicle()], // would be created if the opt-out failed
+      { withCachedVehicles: false },
+    );
+
+    await service.syncVehicles();
+
+    expect(store.rows).toHaveLength(1); // the position row only
+    expect(store.rows[0].providerName).toBe('airotrack');
+    expect(getVehicles).not.toHaveBeenCalled(); // no second HTTP GET
+  });
+
+  it('G7. never touches client assignment or driver on an existing row', async () => {
+    const store = makeStore([legitRow()]); // assigned to client-nesto
+    const { service } = makeService(store, [], 'TRANSIGHT', 300, [
+      invVehicle({
+        providerVehicleId: '228068',
+        vehicleNumber: 'KL84D1577',
+        imei: '860560066144082',
+      }),
+    ]);
+
+    await service.syncVehicles();
+
+    expect(store.vehicle.create).not.toHaveBeenCalled();
+    expect(store.rows[0].clientId).toBe('client-nesto');
+    expect(store.rows[0].driverName).toBe('Real Driver');
+    for (const call of store.vehicle.update.mock.calls) {
+      expect(call[0].data).not.toHaveProperty('clientId');
+      expect(call[0].data).not.toHaveProperty('driverName');
+    }
+  });
+
+  it('G8. a gap-fill failure never discards the positions already synced', async () => {
+    // Seed the position's vehicle so the position path UPDATES (no create of its own);
+    // the only create in this tick is then the gap-fill's, which we make fail.
+    const store = makeStore([legitRow()]);
+    store.vehicle.create.mockRejectedValueOnce(new Error('boom'));
+    const { service } = makeService(store, [transightPos()], 'TRANSIGHT', 300, [
+      invVehicle(), // a DIFFERENT vehicle, so the gap-fill attempts a create
+    ]);
+
+    await expect(service.syncVehicles()).resolves.not.toThrow();
+
+    // The position telemetry still landed even though the inventory pass threw...
+    const positioned = store.rows.find((r) => r.vehicleNumber === 'KL84D1577');
+    expect(positioned?.speed).toBe(12);
+    // ...and the failed gap-fill created nothing.
+    expect(store.rows).toHaveLength(1);
   });
 });

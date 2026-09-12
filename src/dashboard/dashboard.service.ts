@@ -210,6 +210,11 @@ export class DashboardService {
             clientId,
           }
         : undefined,
+      // Only the two columns this function reads: effectiveVehicleStatus takes
+      // { status, isOnline }, and totalVehicles is the row count. The counters and the
+      // response shape are unchanged — this just stops shipping ~20 unused columns
+      // per vehicle back from Postgres.
+      select: { status: true, isOnline: true },
     });
 
     let totalVehicles = vehicles.length;

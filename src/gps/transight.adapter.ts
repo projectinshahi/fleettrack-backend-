@@ -27,8 +27,19 @@ export class TransightAdapter implements GpsProvider {
     string,
     { vehicleId: string; vehicleNumber: string }
   >();
+  /** Last successfully fetched inventory, kept so the sync can gap-fill without a call. */
+  private inventory: NormalizedVehicle[] = [];
   private inventoryFetchedAt = 0;
+  /** Last ATTEMPT (success or failure) — separate from the success clock above. */
+  private inventoryAttemptedAt = 0;
   private static readonly INVENTORY_TTL_MS = 6 * 60 * 60 * 1000; // 6h
+  /**
+   * Floor between inventory ATTEMPTS. get_all_vehicles is capped at 100/day, i.e. one
+   * call per 14.4 minutes, so a 15-minute floor bounds the absolute worst case (every
+   * call failing, all day) at 96 calls — under the cap by construction rather than by
+   * relying on the poll cadence.
+   */
+  private static readonly INVENTORY_RETRY_MS = 15 * 60 * 1000;
 
   constructor(private config: GpsProviderConfig) {}
 
@@ -175,17 +186,37 @@ export class TransightAdapter implements GpsProvider {
   async getVehicles(): Promise<NormalizedVehicle[]> {
     const json = await this.post('get_all_vehicles');
     const vehicles = TransightAdapter.normalizeInventory(json);
-    this.inventoryByImei.clear();
-    for (const v of vehicles) {
-      if (v.imei) {
-        this.inventoryByImei.set(v.imei, {
-          vehicleId: v.providerVehicleId,
-          vehicleNumber: v.vehicleNumber,
-        });
+
+    // Build the new map LOCALLY and swap it in only when the response actually carried
+    // vehicles. The previous clear()-then-refill destroyed a working identity cache the
+    // moment Transight returned an empty (but successful) list — after which every
+    // position fell back to an IMEI key, which is precisely how 12 duplicate rows were
+    // created on 2026-08-14. Holding a stale identity is strictly better than losing all
+    // of them.
+    if (vehicles.length) {
+      const byImei = new Map<string, { vehicleId: string; vehicleNumber: string }>();
+      for (const v of vehicles) {
+        if (v.imei) {
+          byImei.set(v.imei, {
+            vehicleId: v.providerVehicleId,
+            vehicleNumber: v.vehicleNumber,
+          });
+        }
       }
+      this.inventory = vehicles;
+      this.inventoryByImei = byImei;
     }
+
     this.inventoryFetchedAt = Date.now();
     return vehicles;
+  }
+
+  /**
+   * The inventory from the last SUCCESSFUL refresh. Pure in-memory read — makes no API
+   * call, so the sync can gap-fill on every poll without touching the 100/day cap.
+   */
+  cachedVehicles(): NormalizedVehicle[] {
+    return this.inventory;
   }
 
   /**
@@ -198,9 +229,23 @@ export class TransightAdapter implements GpsProvider {
    * the logs, and distinguishable from the harmless "stale but usable" case.
    */
   private async ensureInventory(): Promise<void> {
-    const stale =
-      Date.now() - this.inventoryFetchedAt > TransightAdapter.INVENTORY_TTL_MS;
-    if (this.inventoryByImei.size === 0 || stale) {
+    const now = Date.now();
+
+    // "Never fetched" is the SUCCESS clock being unset — not the map being empty. Keying
+    // this off map size meant a successful-but-empty response (or one whose rows all
+    // lacked an IMEI) left size 0 with a refreshed timestamp, so the condition re-fired on
+    // every 5-minute poll: 288 inventory calls/day against a 100/day cap, self-inflicted.
+    const cold = this.inventoryFetchedAt === 0;
+    const stale = now - this.inventoryFetchedAt > TransightAdapter.INVENTORY_TTL_MS;
+    if (!cold && !stale) return;
+
+    // Floor on ATTEMPTS, not successes. Without it a failing inventory call retries on
+    // every poll forever — and the day that matters most is the day the quota is already
+    // exhausted. Stamped BEFORE the call so a throw cannot skip it.
+    if (now - this.inventoryAttemptedAt < TransightAdapter.INVENTORY_RETRY_MS) return;
+    this.inventoryAttemptedAt = now;
+
+    {
       try {
         await this.getVehicles();
       } catch (e) {
