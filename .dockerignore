@@ -1,0 +1,39 @@
+# Build context exclusions for the API image.
+#
+# node_modules is the important one: the host copy holds a Windows Prisma engine
+# (query_engine-windows.dll.node) and would silently poison the Linux image. Every stage
+# runs `npm ci` instead. package-lock.json is NOT excluded — npm ci requires it.
+
+node_modules
+dist
+.git
+.gitignore
+
+# Secrets — must never enter an image layer. DATABASE_URL, JWT_SECRET and the SMTP
+# credentials are supplied at runtime.
+.env
+.env.*
+
+# Runtime data. Proof-of-delivery photos and receipts live on a persistent volume in
+# production; baking them in would ship stale user data with every image.
+uploads
+
+# Test / tooling output
+coverage
+*.log
+test
+
+# Local diagnostic scripts — not part of the running service.
+scripts
+
+# Editor / OS noise
+.vscode
+.idea
+.DS_Store
+
+# Docker's own files
+Dockerfile
+.dockerignore
+
+# Kept ON PURPOSE (do not add these): prisma/schema.prisma, prisma/migrations,
+# package.json, package-lock.json, src, tsconfig*.json, nest-cli.json

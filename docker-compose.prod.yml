@@ -1,0 +1,90 @@
+# FleetTrack — PRODUCTION Compose (Hostinger VPS).
+#
+# Lives in the fleettrack-api repo and builds the sibling frontend repo, so BOTH repos
+# must be cloned side by side and this file must be run from the fleettrack-api dir:
+#
+#   /srv/fleettrack/
+#   ├── fleettrack-api/      <- this file; run `docker compose` from here
+#   ├── fleettrack-admin/
+#   └── uploads/             <- persistent, outside both repos
+#
+# Deliberately NO postgres and NO redis: the database is external managed Neon.
+# Deliberately NO nginx service: Nginx runs on the HOST so Certbot can manage TLS and
+# renew without rebuilding a container. Both apps publish to 127.0.0.1 only, so Nginx
+# is the sole public entry point and nothing is reachable from the internet directly.
+
+name: fleettrack
+
+services:
+  api:
+    build:
+      context: .
+    image: fleettrack-api:prod
+
+    # Runtime injection only — never baked into an image layer (.dockerignore excludes
+    # .env from the build context). This file holds DATABASE_URL, JWT_SECRET, SMTP and
+    # GPS credentials and must exist on the VPS with 600 permissions.
+    env_file:
+      - ./.env
+
+    environment:
+      UPLOAD_DIR: /app/uploads
+      NODE_ENV: production
+      # This container is the ONE process that runs the scheduled jobs (GPS provider sync,
+      # offline sweep, ETA alerts). The app defaults them OFF, so a developer machine or any
+      # second container pointed at the same database can never become a second writer.
+      # Keep this service at a single replica.
+      SCHEDULED_JOBS_ENABLED: "true"
+
+    # Loopback ONLY. Publishing 0.0.0.0:5000 would expose the API to the internet
+    # directly, bypassing Nginx, TLS and rate limiting.
+    ports:
+      - "127.0.0.1:5000:5000"
+
+    volumes:
+      # Absolute host path OUTSIDE both git repos, so `git pull` can never touch user
+      # data and a container rebuild cannot destroy it. The container runs as uid 1000,
+      # so this directory must be `chown -R 1000:1000` on the host.
+      - /srv/fleettrack/uploads:/app/uploads
+
+    restart: unless-stopped
+
+    # Healthcheck comes from the Dockerfile (GET /api/v1/health) — not redefined here.
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  web:
+    build:
+      # Sibling repo. Compose resolves this relative to THIS file's directory.
+      context: ../fleettrack-admin
+      args:
+        # BUILD-time only: these are inlined into the browser bundle by `next build`.
+        # Setting them at runtime does nothing. Changing one requires a rebuild.
+        #
+        # Values are the PUBLIC URLs the browser will use — never Docker-internal names
+        # like http://api:5000, which resolve only between containers.
+        #
+        # NOTHING SECRET BELONGS HERE. No DATABASE_URL, JWT_SECRET, SMTP_* or GPS
+        # credentials — every NEXT_PUBLIC_* value ships to the browser in clear text.
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:?set NEXT_PUBLIC_API_URL before building}
+        NEXT_PUBLIC_SOCKET_URL: ${NEXT_PUBLIC_SOCKET_URL:?set NEXT_PUBLIC_SOCKET_URL before building}
+        NEXT_PUBLIC_GOOGLE_MAPS_API_KEY: ${NEXT_PUBLIC_GOOGLE_MAPS_API_KEY:?set NEXT_PUBLIC_GOOGLE_MAPS_API_KEY before building}
+    image: fleettrack-admin:prod
+
+    ports:
+      - "127.0.0.1:3000:3000"
+
+    restart: unless-stopped
+
+    # No depends_on: the web container never talks to the api container. Every API and
+    # Socket.IO call is made by the BROWSER, to the public URL, through Nginx.
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

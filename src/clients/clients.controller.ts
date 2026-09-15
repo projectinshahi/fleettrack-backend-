@@ -10,12 +10,10 @@ import {
 } from '@nestjs/common';
 
 import { ClientsService } from './clients.service';
-
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
-
 import { RolesGuard } from '../auth/roles.guard';
-
 import { Roles } from '../auth/roles.decorator';
+import { CreateClientDto } from './dto/create-client.dto';
 
 @Controller('clients')
 export class ClientsController {
@@ -24,11 +22,12 @@ export class ClientsController {
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles('ADMIN')
   @Post()
-  create(@Body() body: any) {
-    return this.clientsService.create(body);
+  create(@Body() dto: CreateClientDto) {
+    return this.clientsService.create(dto);
   }
 
-  @UseGuards(JwtAuthGuard)
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('ADMIN')
   @Get()
   findAll() {
     return this.clientsService.findAll();

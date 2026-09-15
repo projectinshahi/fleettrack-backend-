@@ -12,17 +12,32 @@ model User {
   name      String
   email     String   @unique
   password  String
-  role      Role     @default(VIEWER)
+  role      Role     @default(ADMIN)
   createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Client {
+  id        String     @id @default(cuid())
+  name      String
+  email     String     @unique
+  password  String
+  apiUrl    String
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+  vehicles  Vehicle[]
+  trips     Trip[]
+  customers Customer[]
+  tripRequests TripRequest[]
 }
 
 model Vehicle {
   id                 String                   @id @default(cuid())
   vehicleName        String
-  vehicleNumber      String                   @unique
+  vehicleNumber      String
   gpsDeviceId        String
   driverName         String
-  clientName         String
+  clientId           String?
   status             VehicleStatus            @default(IDLE)
   latitude           Float                    @default(0)
   longitude          Float                    @default(0)
@@ -37,11 +52,13 @@ model Vehicle {
   lastSeenAt         DateTime?
   providerName       String?
   providerVehicleId  String?
+  imei               String?
+  client             Client?                  @relation(fields: [clientId], references: [id], onDelete: SetNull)
   locationHistory    VehicleLocationHistory[]
+  trips              Trip[]
 
-  @@index([vehicleNumber])
-  @@index([status])
-  @@index([lastProviderUpdate])
+  @@unique([clientId, vehicleNumber])
+  @@unique([providerName, providerVehicleId])
 }
 
 model VehicleLocationHistory {
@@ -53,21 +70,484 @@ model VehicleLocationHistory {
   ignition  Boolean
   heading   Float    @default(0)
   createdAt DateTime @default(now())
-
-  vehicle Vehicle @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+  vehicle   Vehicle  @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
 
   @@index([vehicleId])
   @@index([createdAt])
+  // Serves "WHERE vehicleId = ? ORDER BY createdAt DESC" — the latest-fix lookup in
+  // TrackingService and the 1-hour history window in VehiclesService. With only the two
+  // single-column indexes above, Postgres scanned createdAt backwards and filtered on
+  // vehicleId, discarding up to 1,077 rows to return 1.
+  @@index([vehicleId, createdAt])
 }
 
 enum Role {
   ADMIN
-  FLEET_MANAGER
-  VIEWER
 }
 
 enum VehicleStatus {
   MOVING
   IDLE
   OFFLINE
+}
+
+enum TripStatus {
+  PLANNED
+  ASSIGNED
+  STARTED
+  ONGOING
+  DELAYED
+  COMPLETED
+  CANCELLED
+}
+
+enum TripEventAction {
+  CREATED
+  UPDATED
+  STATUS_CHANGED
+}
+
+model Trip {
+  id        String     @id @default(cuid())
+  reference String     @unique
+  status    TripStatus @default(PLANNED)
+
+  // Owner (the client that manages the trip)
+  clientId String
+  client   Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  // Assignment (nullable until assigned)
+  vehicleId  String?
+  vehicle    Vehicle? @relation(fields: [vehicleId], references: [id], onDelete: SetNull)
+  driverId   String?
+  driverName String?
+  // Driver contact captured at ADMIN direct-create or at request approval. Nullable in
+  // the DB so existing trips migrate untouched; required-ness is enforced for the ADMIN
+  // create and approval paths in the service/DTO, not by the column.
+  driverPhone String?
+
+  // Customer this trip is for (CUS-07) — nullable; detaches on customer delete
+  customerId String?
+  customer   Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+
+  // Route (coords optional — geocoded on create)
+  origin         String
+  originLat      Float?
+  originLng      Float?
+  destination    String
+  destinationLat Float?
+  destinationLng Float?
+
+  distanceKm   Float   @default(0)
+  durationMins Int     @default(0)
+  notes        String?
+
+  scheduledStart DateTime
+  scheduledEnd   DateTime
+  startedAt      DateTime?
+  completedAt    DateTime?
+
+  // ETA-06.1 monitor state (server-side, never user-facing). Persisted so the
+  // once-per-episode alerting is deterministic across restarts and safe with
+  // multiple instances (claimed via atomic compare-and-set). Not driven by, and
+  // never drives, trip.status.
+  etaDelayAlertedAt DateTime? // set while an ETA-predicted delay episode is active
+  etaBaseline       DateTime? // last accepted ETA; a significant drift re-baselines + alerts
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  stops       TripStop[]
+  events      TripEvent[]
+  breadcrumbs TripBreadcrumb[]
+  delays      Delay[]
+  cost        TripCost?
+  files       FileAsset[]
+  pod         ProofOfDelivery?
+
+  @@index([clientId])
+  @@index([vehicleId])
+  @@index([customerId])
+}
+
+// Trip cost breakdown (TCM-01). One row per trip (1:1), holding both the estimated
+// (TCM-01) and actual (TCM-02) amount for each fixed cost component. Estimated and
+// actual share this single model; variance (TCM-04) is derived (actual − estimated),
+// not stored. Kept out of Trip to avoid bloating it with cost columns.
+model TripCost {
+  id     String @id @default(cuid())
+  tripId String @unique
+  trip   Trip   @relation(fields: [tripId], references: [id], onDelete: Cascade)
+
+  // Estimated per component (TCM-01)
+  estimatedFuel        Float @default(0)
+  estimatedTolls       Float @default(0)
+  estimatedAllowance   Float @default(0)
+  estimatedParking     Float @default(0)
+  estimatedMaintenance Float @default(0)
+  estimatedMisc        Float @default(0)
+
+  // Actual per component (TCM-02)
+  actualFuel        Float @default(0)
+  actualTolls       Float @default(0)
+  actualAllowance   Float @default(0)
+  actualParking     Float @default(0)
+  actualMaintenance Float @default(0)
+  actualMisc        Float @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model TripStop {
+  id       String @id @default(cuid())
+  tripId   String
+  trip     Trip   @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  address  String
+  sequence Int
+  lat      Float?
+  lng      Float?
+
+  // TM-02.2 — stop completion (set in sequence while the trip is in transit). The
+  // final stop's completedAt is what gates the trip's COMPLETED transition.
+  completedAt DateTime?
+  completedBy String?
+
+  @@index([tripId])
+}
+
+model TripEvent {
+  id        String          @id @default(cuid())
+  tripId    String
+  trip      Trip            @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  action    TripEventAction
+  status    TripStatus?
+  note      String?
+  actorRole String
+  actorName String?
+  createdAt DateTime        @default(now())
+
+  @@index([tripId])
+}
+
+// GPS breadcrumb recorded server-side from the vehicle feed while a trip is active,
+// so a completed trip can replay its actual travelled route (mirrors
+// VehicleLocationHistory but scoped to a trip).
+model TripBreadcrumb {
+  id        String   @id @default(cuid())
+  tripId    String
+  trip      Trip     @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  latitude  Float
+  longitude Float
+  speed     Float    @default(0)
+  heading   Float    @default(0)
+  createdAt DateTime @default(now())
+
+  @@index([tripId])
+  @@index([createdAt])
+}
+
+// Field-reported trip delay (DLY-01.1). A delay record reported against a trip —
+// from the Admin Portal now, and reusable for the future Driver App (via `source`).
+// Ownership follows the trip: a CLIENT sees only its own trips' delays; ADMIN all.
+enum DelayCategory {
+  TRAFFIC
+  WEATHER
+  BREAKDOWN
+  ACCIDENT
+  LOADING
+  CUSTOMER
+  DOCUMENTATION
+  OTHER
+}
+
+model Delay {
+  id              String        @id @default(cuid())
+  tripId          String
+  trip            Trip          @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  category        DelayCategory
+  reason          String?
+  remarks         String?
+  durationMinutes Int           @default(0)
+  reportedAt      DateTime      @default(now())
+  // Origin of the report — PORTAL now; DRIVER_APP once the field app is live.
+  source          String        @default("PORTAL")
+  reportedBy      String?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  @@index([tripId])
+  @@index([category])
+}
+
+// Customer directory (shipper / receiver / corporate) — tenant-owned data: each
+// customer belongs to the CLIENT that manages it (CUS-01/02). A CLIENT sees and
+// manages only its own customers; the ADMIN does not manage customers.
+enum CustomerType {
+  SHIPPER
+  RECEIVER
+  CORPORATE
+}
+
+model Customer {
+  id   String       @id @default(cuid())
+  name String
+  type CustomerType
+
+  // Owning client (tenant) — a CLIENT manages only its own customers
+  clientId String
+  client   Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  // Contact information (CUS-03.1)
+  company       String?
+  contactPerson String?
+  email         String?
+  phone         String?
+  address       String?
+
+  // Tax / registration details (CUS-04.1)
+  taxId              String?
+  registrationNumber String?
+
+  // Free-text notes (CUS-08.1)
+  notes String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Reusable pickup/delivery address book (CUS-05 / CUS-06)
+  addresses CustomerAddress[]
+
+  // Trips placed for this customer (CUS-07)
+  trips Trip[]
+
+  @@index([clientId])
+  @@index([type])
+}
+
+// A reusable pickup or delivery address for a customer (CUS-05 / CUS-06).
+// isDefault flags the preferred address per kind for future trip auto-selection.
+enum AddressKind {
+  PICKUP
+  DELIVERY
+}
+
+model CustomerAddress {
+  id         String      @id @default(cuid())
+  customerId String
+  customer   Customer    @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  kind       AddressKind
+  label      String
+  address    String
+  latitude   Float?
+  longitude  Float?
+  isDefault  Boolean     @default(false)
+  createdAt  DateTime    @default(now())
+  updatedAt  DateTime    @updatedAt
+
+  @@index([customerId])
+  @@index([customerId, kind])
+}
+
+// Uploaded file (shared upload infrastructure). Provider-agnostic: `storageKey` is the
+// opaque key in whatever storage backend saved it (local filename now; S3/Cloudinary key
+// later) and `provider` records which one — the display URL is resolved at read time by
+// the StorageService, never stored, so switching providers needs no schema change.
+// Domain-neutral: `category` discriminates what a file is (a trip cost receipt, POD photo,
+// POD signature) and every file attaches to a Trip (the delivery both receipts and POD
+// relate to). The owning module interprets the category; the Upload module does not.
+enum FileCategory {
+  RECEIPT
+  POD_PHOTO
+  POD_SIGNATURE
+}
+
+// TCM-03.2 — the fixed trip-cost components a RECEIPT file can be attached to. Mirrors
+// COST_COMPONENTS in trip-cost.util.ts (uppercased). Only meaningful for RECEIPT files.
+enum CostComponent {
+  FUEL
+  TOLLS
+  ALLOWANCE
+  PARKING
+  MAINTENANCE
+  MISC
+}
+
+model FileAsset {
+  id             String         @id @default(cuid())
+  storageKey     String         @unique
+  provider       String         @default("local")
+  category       FileCategory
+  // TCM-03.2 — for a RECEIPT, the cost component it belongs to (null = general/trip-level
+  // receipt). Ignored for POD_* categories. Additive + nullable, so existing files stay valid.
+  costComponent  CostComponent?
+  originalName   String
+  mimeType       String
+  size           Int
+  tripId         String
+  trip           Trip           @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  uploadedBy     String?
+  uploadedByRole String?
+  createdAt      DateTime       @default(now())
+
+  @@index([tripId])
+  @@index([category])
+  @@index([tripId, category])
+}
+
+// Proof of delivery (POD-01 / POD-03 / POD-04). Delivery-confirmation metadata for a
+// trip — who received it, notes, and when — one row per trip (1:1), mirroring TripCost.
+// The proof MEDIA (photos POD-02/05, signature POD-06) is deliberately NOT stored here:
+// it reuses the shared FileAsset table via category POD_PHOTO / POD_SIGNATURE, so POD
+// adds no upload or storage logic. "Confirmed" is derived from deliveredAt being set.
+model ProofOfDelivery {
+  id              String    @id @default(cuid())
+  tripId          String    @unique
+  trip            Trip      @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  recipientName   String?
+  notes           String?
+  deliveredAt     DateTime?
+  confirmedBy     String?
+  confirmedByRole String?
+
+  // POD-04.1/04.2 — delivery geolocation captured on confirmation (additive, nullable
+  // so existing PODs stay valid). Optional by design: capture failure never blocks
+  // confirmation, so any of these may be null even for a confirmed delivery.
+  deliveredLat              Float? // latitude  (−90..90)
+  deliveredLng              Float? // longitude (−180..180)
+  deliveredLocationAccuracy Float? // fix accuracy in metres (>= 0), from the Geolocation API
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// In-portal notification (NOT-01…04). A persisted operational alert raised by a domain
+// event: trip started / delayed / completed (NOT-01.2 / NOT-02.1 / NOT-03.1) and proof of
+// delivery confirmed (NOT-04.1). Scoped by `clientId` (the owning trip's client) so read
+// access follows the same rule as trips — a CLIENT sees only its own, an ADMIN sees all.
+// The NotificationsService is the single writer; on create it emits a lightweight signal
+// over the shared tracking socket. `tripId` is a plain column (no relation) to keep the
+// completed Trip model untouched; the frontend guards the (rare) dangling-trip link.
+enum NotificationType {
+  TRIP_STARTED
+  TRIP_DELAYED
+  TRIP_COMPLETED
+  POD_UPLOADED
+  TRIP_REQUESTED
+  TRIP_REQUEST_APPROVED
+  TRIP_REQUEST_REJECTED
+}
+
+model Notification {
+  id      String           @id @default(cuid())
+  type    NotificationType
+  title   String
+  message String
+  // Audience: a non-null clientId is a client-specific notification (that client only);
+  // a null clientId is an ADMIN-audience notification (Trip Request workflow). Scoped
+  // reads honour this — CLIENT: {clientId: self}, ADMIN: {clientId: null}.
+  clientId       String?
+  tripId         String?
+  tripRequestId  String?
+  read           Boolean          @default(false)
+  createdAt      DateTime         @default(now())
+
+  @@index([clientId])
+  @@index([clientId, read])
+  @@index([createdAt])
+}
+
+// Password reset token (auth). Supports BOTH login principals — a User (ADMIN)
+// and a Client — which live in separate tables, so the account is keyed by email +
+// accountType rather than a relation. The raw token is emailed (or logged in dev); only
+// its SHA-256 hash is stored, so a database leak cannot be used to reset a password.
+// Single-use (usedAt) and time-limited (expiresAt).
+model PasswordResetToken {
+  id          String    @id @default(cuid())
+  tokenHash   String    @unique
+  email       String
+  accountType String
+  expiresAt   DateTime
+  usedAt      DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([email])
+  @@index([expiresAt])
+}
+
+enum GpsProviderName {
+  AIROTRACK
+  TRANSIGHT
+}
+
+// Backend-only GPS provider configuration. The credential (AiroTrack token /
+// Transight apikey) lives in `credential` and is NEVER serialized to any API,
+// socket, or log — read APIs return masked/metadata only; a write API sets it.
+// One row per provider (provider is unique).
+model GpsIntegration {
+  id              String          @id @default(cuid())
+  provider        GpsProviderName @unique
+  active          Boolean         @default(false)
+  baseUrl         String
+  system          String?
+  credential      String?
+  pollIntervalSec Int             @default(300)
+  lastSyncedAt    DateTime?
+  lastError       String?
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+}
+
+enum TripRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+// A client-submitted trip proposal awaiting admin approval (Trip Request + Approval
+// workflow). It stores the full trip-create payload so an approved request rebuilds the
+// exact CreateTripDto and reuses TripsService.create() — no separate creation path. No
+// Trip exists until approval (tripId is set then). `stops` is the raw ordered stop array
+// as JSON (not a child table — a request is transient). `reviewedById` is the ADMIN
+// (User) who approved/rejected. Deleting the owning client cascades its requests.
+model TripRequest {
+  id     String            @id @default(cuid())
+  status TripRequestStatus @default(PENDING)
+
+  clientId String
+  client   Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  // Trip payload snapshot — rebuilt into a CreateTripDto on approval.
+  reference      String?
+  vehicleId      String?
+  driverId       String?
+  // Driver is NOT supplied by the CLIENT — both fields stay null until an ADMIN enters
+  // them in the approval modal, at which point they are written here and onto the Trip.
+  driverName     String?
+  driverPhone    String?
+  customerId     String?
+  origin         String
+  destination    String
+  originLat      Float?
+  originLng      Float?
+  destinationLat Float?
+  destinationLng Float?
+  stops          Json?
+  distanceKm     Float?
+  durationMins   Int?
+  notes          String?
+  scheduledStart DateTime
+  scheduledEnd   DateTime
+
+  // Set on approval (the created Trip); review metadata set on approve/reject.
+  tripId          String?
+  reviewedById    String?
+  reviewedAt      DateTime?
+  rejectionReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([clientId])
+  @@index([status])
 }

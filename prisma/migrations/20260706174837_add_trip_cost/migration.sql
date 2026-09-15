@@ -1,0 +1,27 @@
+-- CreateTable
+CREATE TABLE "TripCost" (
+    "id" TEXT NOT NULL,
+    "tripId" TEXT NOT NULL,
+    "estimatedFuel" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "estimatedTolls" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "estimatedAllowance" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "estimatedParking" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "estimatedMaintenance" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "estimatedMisc" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "actualFuel" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "actualTolls" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "actualAllowance" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "actualParking" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "actualMaintenance" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "actualMisc" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+
+    CONSTRAINT "TripCost_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateIndex
+CREATE UNIQUE INDEX "TripCost_tripId_key" ON "TripCost"("tripId");
+
+-- AddForeignKey
+ALTER TABLE "TripCost" ADD CONSTRAINT "TripCost_tripId_fkey" FOREIGN KEY ("tripId") REFERENCES "Trip"("id") ON DELETE CASCADE ON UPDATE CASCADE;

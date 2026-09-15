@@ -56,3 +56,9 @@ pids
 report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
 
 /generated/prisma
+
+# User-uploaded files (UPLOAD_DIR). Runtime data written by LocalDiskStorageService —
+# proof-of-delivery photos and trip receipts. Never source. In production this path is a
+# persistent volume/bind-mount that must survive redeploys, so a `git pull` must never
+# touch it.
+uploads/
