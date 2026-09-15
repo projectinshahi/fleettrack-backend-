@@ -45,9 +45,11 @@ export class AuthService {
       accountType = 'CLIENT';
     }
 
+    // One message for an unknown account and a wrong password. Two different messages told
+    // a caller which emails have accounts, which is the first step of guessing passwords.
     if (!account) {
       throw new UnauthorizedException(
-        'Invalid email',
+        'Invalid email or password',
       );
     }
 
@@ -59,7 +61,7 @@ export class AuthService {
 
     if (!isPasswordValid) {
       throw new UnauthorizedException(
-        'Invalid password',
+        'Invalid email or password',
       );
     }
 

@@ -19,13 +19,17 @@ import { MailModule } from './mail/mail.module';
 import { GpsModule } from './gps/gps.module';
 import { TripRequestsModule } from './trip-requests/trip-requests.module';
 import { HealthController } from './health.controller';
+import { scheduledJobsEnabled } from './common/scheduled-jobs';
 
 @Module({
   // Registered here rather than as its own module: the health check has no service, no
   // providers and no dependencies, so a dedicated module would be an empty wrapper.
   controllers: [HealthController],
   imports: [
-    ScheduleModule.forRoot(),
+    // The @Cron jobs (GPS provider sync, offline sweep, ETA alerts) exist only in the ONE
+    // process that opts in; see common/scheduled-jobs.ts. Without ScheduleModule their
+    // handlers never start, so no other process can become a second writer.
+    ...(scheduledJobsEnabled() ? [ScheduleModule.forRoot()] : []),
     PrismaModule,
     MailModule,
     AuthModule,

@@ -19,8 +19,9 @@ import { MailPayload, SendPasswordResetParams } from './mail.types';
  * by adding one thin method per email type on top of the private `send()`.
  *
  * Fail-safe by design: if SMTP is not configured, or a send fails, it LOGS (including the
- * reset URL as a fallback) and never throws — so callers such as forgot-password can always
- * return a generic success and never reveal whether an email exists.
+ * reset URL as a fallback, outside production only) and never throws — so callers such as
+ * forgot-password can always return a generic success and never reveal whether an email
+ * exists.
  */
 @Injectable()
 export class MailService implements OnModuleInit {
@@ -39,7 +40,7 @@ export class MailService implements OnModuleInit {
 
     if (!this.transporter) {
       this.logger.warn(
-        'SMTP is not configured (SMTP_HOST missing) — password reset links will be logged instead of emailed.',
+        'SMTP is not configured (SMTP_HOST missing) — password reset emails cannot be sent (links are logged outside production only).',
       );
       return;
     }
@@ -103,6 +104,17 @@ export class MailService implements OnModuleInit {
     );
   }
 
+  /**
+   * A reset link is a bearer credential for the account until it expires, and container logs
+   * are kept and readable by anyone with access to the host, so production logs never carry
+   * one. Local development still logs it, which is how a reset is tested without SMTP.
+   */
+  private loggableLink(url: string): string {
+    return process.env.NODE_ENV === 'production'
+      ? '[withheld in production]'
+      : url;
+  }
+
   /** Core sender. Falls back to logging when SMTP is unavailable or a send fails. */
   private async send(
     payload: MailPayload,
@@ -111,7 +123,7 @@ export class MailService implements OnModuleInit {
     if (!this.transporter) {
       this.logger.warn(
         `No mail provider configured — email to ${payload.to} not sent.${
-          fallbackUrl ? ` Reset link: ${fallbackUrl}` : ''
+          fallbackUrl ? ` Reset link: ${this.loggableLink(fallbackUrl)}` : ''
         }`,
       );
       return;
@@ -134,7 +146,7 @@ export class MailService implements OnModuleInit {
       );
       if (fallbackUrl) {
         this.logger.warn(
-          `Fallback — reset link for ${payload.to}: ${fallbackUrl}`,
+          `Fallback — reset link for ${payload.to}: ${this.loggableLink(fallbackUrl)}`,
         );
       }
       // Deliberately swallowed: never surface delivery failures to the caller.

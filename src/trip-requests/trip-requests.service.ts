@@ -21,6 +21,10 @@ type TripRequestVehicle = {
   vehicleName: string;
 };
 
+/** Name-only summaries for the other plain-scalar references on a request. */
+type TripRequestNamed = { id: string; name: string };
+type TripRequestResultTrip = { id: string; reference: string };
+
 /**
  * Trip Request + Admin Approval workflow (Slice 1). A CLIENT submits the existing trip
  * payload; it is stored as a PENDING TripRequest — NO Trip is created here. Approval
@@ -100,7 +104,7 @@ export class TripRequestsService {
       include: { client: { select: { id: true, name: true } } },
     });
 
-    return { success: true, requests: await this.withVehicles(requests) };
+    return { success: true, requests: await this.withReferences(requests) };
   }
 
   /** A request the CLIENT owns, or any request for an ADMIN; 404 if missing. */
@@ -116,9 +120,9 @@ export class TripRequestsService {
       throw new ForbiddenException('Not your request');
     }
 
-    const [withVehicle] = await this.withVehicles([request]);
+    const [withRefs] = await this.withReferences([request]);
 
-    return { success: true, request: withVehicle };
+    return { success: true, request: withRefs };
   }
 
   /* ---------------------------------------------------------------- */
@@ -278,33 +282,82 @@ export class TripRequestsService {
    * client submitted; dates are serialized back to ISO strings (create() re-parses them).
    */
   /**
-   * Attach the referenced Vehicle to each request.
+   * Attach what each request's plain-scalar ids point at: the vehicle, the customer, the
+   * reviewing admin and the trip an approval created.
    *
-   * TripRequest stores `vehicleId` as a plain scalar, NOT a Prisma relation — the row is a
-   * deliberate payload snapshot, so it must not cascade or drift when a vehicle is edited.
-   * That means `include` cannot reach the vehicle, which is why the detail page rendered a
-   * blank. One batched lookup keyed by id fills it in without an N+1 and without changing
-   * the schema or the snapshot semantics.
+   * TripRequest stores these as scalars, NOT Prisma relations — the row is a deliberate
+   * payload snapshot, so it must not cascade or drift when a vehicle is edited. `include`
+   * therefore cannot reach them. The vehicle was already resolved this way; the customer,
+   * reviewer and resulting trip were not, so the detail page and the CSV export printed "—"
+   * for Customer, Reviewed by and Resulting trip on every request. One batched lookup per
+   * kind (skipped when no request references one) avoids an N+1; a reference whose target
+   * is gone resolves to null.
    */
-  private async withVehicles<T extends { vehicleId: string | null }>(
+  private async withReferences<
+    T extends {
+      vehicleId: string | null;
+      customerId: string | null;
+      reviewedById: string | null;
+      tripId: string | null;
+    },
+  >(
     requests: T[],
-  ): Promise<(T & { vehicle: TripRequestVehicle | null })[]> {
-    const ids = [
-      ...new Set(requests.map((r) => r.vehicleId).filter((id): id is string => !!id)),
+  ): Promise<
+    (T & {
+      vehicle: TripRequestVehicle | null;
+      customer: TripRequestNamed | null;
+      reviewedBy: TripRequestNamed | null;
+      trip: TripRequestResultTrip | null;
+    })[]
+  > {
+    const idsOf = (pick: (r: T) => string | null) => [
+      ...new Set(requests.map(pick).filter((id): id is string => !!id)),
     ];
+    const vehicleIds = idsOf((r) => r.vehicleId);
+    const customerIds = idsOf((r) => r.customerId);
+    const reviewerIds = idsOf((r) => r.reviewedById);
+    const tripIds = idsOf((r) => r.tripId);
 
-    const vehicles = ids.length
-      ? await this.prisma.vehicle.findMany({
-          where: { id: { in: ids } },
-          select: { id: true, vehicleNumber: true, vehicleName: true },
-        })
-      : [];
+    const [vehicles, customers, reviewers, trips] = await Promise.all([
+      vehicleIds.length
+        ? this.prisma.vehicle.findMany({
+            where: { id: { in: vehicleIds } },
+            select: { id: true, vehicleNumber: true, vehicleName: true },
+          })
+        : ([] as TripRequestVehicle[]),
+      customerIds.length
+        ? this.prisma.customer.findMany({
+            where: { id: { in: customerIds } },
+            select: { id: true, name: true },
+          })
+        : ([] as TripRequestNamed[]),
+      reviewerIds.length
+        ? this.prisma.user.findMany({
+            where: { id: { in: reviewerIds } },
+            select: { id: true, name: true },
+          })
+        : ([] as TripRequestNamed[]),
+      tripIds.length
+        ? this.prisma.trip.findMany({
+            where: { id: { in: tripIds } },
+            select: { id: true, reference: true },
+          })
+        : ([] as TripRequestResultTrip[]),
+    ]);
 
-    const byId = new Map(vehicles.map((v) => [v.id, v]));
+    const vehicleById = new Map(vehicles.map((v) => [v.id, v]));
+    const customerById = new Map(customers.map((c) => [c.id, c]));
+    const reviewerById = new Map(reviewers.map((u) => [u.id, u]));
+    const tripById = new Map(trips.map((t) => [t.id, t]));
 
     return requests.map((r) => ({
       ...r,
-      vehicle: r.vehicleId ? byId.get(r.vehicleId) ?? null : null,
+      vehicle: r.vehicleId ? (vehicleById.get(r.vehicleId) ?? null) : null,
+      customer: r.customerId ? (customerById.get(r.customerId) ?? null) : null,
+      reviewedBy: r.reviewedById
+        ? (reviewerById.get(r.reviewedById) ?? null)
+        : null,
+      trip: r.tripId ? (tripById.get(r.tripId) ?? null) : null,
     }));
   }
 

@@ -5,6 +5,8 @@ import {
   GpsProviderConfig,
   NormalizedPosition,
   NormalizedVehicle,
+  PROVIDER_REQUEST_TIMEOUT_MS,
+  providerRequestError,
 } from './gps-provider.interface';
 
 /**
@@ -49,13 +51,22 @@ export class TransightAdapter implements GpsProvider {
 
   private async post(endpoint: string): Promise<any> {
     const base = this.config.baseUrl.replace(/\/+$/, '');
-    const res = await fetch(`${base}/${endpoint}/`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ apikey: this.config.credential }),
-    });
-    if (!res.ok) throw new Error(`Transight HTTP ${res.status} on ${endpoint}`);
-    const json = await res.json();
+    // The signal bounds the body read too, not just the headers.
+    const timeoutMs = this.config.timeoutMs ?? PROVIDER_REQUEST_TIMEOUT_MS;
+    let json: any;
+    try {
+      const res = await fetch(`${base}/${endpoint}/`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ apikey: this.config.credential }),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (!res.ok)
+        throw new Error(`Transight HTTP ${res.status} on ${endpoint}`);
+      json = await res.json();
+    } catch (e) {
+      throw providerRequestError(e, `Transight ${endpoint}`, timeoutMs);
+    }
     TransightAdapter.assertOk(json, endpoint);
     return json;
   }

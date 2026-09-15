@@ -1,3 +1,6 @@
+import { createServer, type Server } from 'http';
+import type { AddressInfo } from 'net';
+
 import { AiroTrackAdapter } from './airotrack.adapter';
 
 describe('AiroTrackAdapter.normalizePosition', () => {
@@ -47,5 +50,42 @@ describe('AiroTrackAdapter.normalizePosition', () => {
       charge: null,
     });
     expect(p!.providerTimestamp).toBeNull();
+  });
+});
+
+/**
+ * A stalled provider must not hold the sync tick. fetch() waits up to 300 s for headers by
+ * default and the sync polls providers one after another, so without a per-call timeout one
+ * hung AiroTrack request also kept Transight from being polled.
+ */
+describe('AiroTrackAdapter request timeout', () => {
+  let server: Server;
+  let baseUrl: string;
+
+  beforeAll(async () => {
+    // Accepts the connection and never answers.
+    server = createServer(() => undefined);
+    await new Promise<void>((resolve) =>
+      server.listen(0, '127.0.0.1', resolve),
+    );
+    baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}/positionsByToken`;
+  });
+
+  afterAll(async () => {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  it('gives up after the configured timeout with an error that names the provider', async () => {
+    const adapter = new AiroTrackAdapter({
+      baseUrl,
+      credential: 't',
+      timeoutMs: 150,
+    });
+    const started = Date.now();
+    await expect(adapter.getLatestPositions()).rejects.toThrow(
+      'AiroTrack request timed out after 150 ms',
+    );
+    expect(Date.now() - started).toBeLessThan(5000);
   });
 });

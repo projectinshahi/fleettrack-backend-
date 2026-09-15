@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   Body,
   Controller,
   Delete,
@@ -54,6 +55,23 @@ const MIME_PATTERN = new RegExp(
 );
 
 /**
+ * `inline` Content-Disposition that is always a valid header value: an ASCII fallback name
+ * plus the RFC 5987 UTF-8 name. A raw non-Latin-1 filename (a Malayalam or Hindi receipt
+ * title, say) is an invalid header value, so Node threw and the file could not be opened
+ * (500); a quote in the name broke the parameter.
+ */
+export function contentDisposition(originalName: string): string {
+  const fallback = originalName
+    .replace(/[^\x20-\x7e]/g, '_')
+    .replace(/["\\]/g, '_');
+  const encoded = encodeURIComponent(originalName).replace(
+    /['()*]/g,
+    (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`,
+  );
+  return `inline; filename="${fallback}"; filename*=UTF-8''${encoded}`;
+}
+
+/**
  * Shared upload API — file intake/serving for the whole app (receipts, POD, …).
  * Domain-agnostic: files are keyed by generic `category` + owning `tripId`; role rules
  * mirror the trips module (CLIENT writes its own trips' files, ADMIN reads). File bytes
@@ -82,6 +100,14 @@ export class UploadController {
     )
     file: MulterFile,
   ) {
+    // FileTypeValidator checks the file's magic bytes; this checks the Content-Type the
+    // client DECLARED, which is what gets stored and served back. Without it a real PDF
+    // body declared as text/html passed and was later returned as text/html (and opened as
+    // a blob on the frontend origin): a stored-XSS path.
+    if (!MIME_PATTERN.test(file.mimetype)) {
+      throw new BadRequestException('Unsupported file type');
+    }
+
     return this.uploadService.store(req.user, {
       tripId: dto.tripId,
       category: dto.category,
@@ -118,7 +144,8 @@ export class UploadController {
 
     res.set({
       'Content-Type': mimeType,
-      'Content-Disposition': `inline; filename="${originalName}"`,
+      'Content-Disposition': contentDisposition(originalName),
+      'X-Content-Type-Options': 'nosniff',
     });
     return new StreamableFile(stream);
   }

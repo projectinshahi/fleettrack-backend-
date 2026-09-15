@@ -9,6 +9,11 @@ import { PrismaService } from '../prisma/prisma.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { CreateDelayDto } from './dto/create-delay.dto';
 import { DelayStatsQueryDto } from './dto/delay-stats-query.dto';
+import { driverKey } from '../common/utils/driver-key';
+import {
+  reportRangeEnd,
+  reportRangeStart,
+} from '../common/utils/report-date-range';
 
 type AuthUser = { userId: string; role: string; accountType?: string };
 
@@ -122,8 +127,8 @@ export class DelaysService {
     const period: Granularity = query.period ?? 'month';
 
     const reportedAt: Prisma.DateTimeFilter = {};
-    if (query.from) reportedAt.gte = new Date(query.from);
-    if (query.to) reportedAt.lte = new Date(query.to);
+    if (query.from) reportedAt.gte = reportRangeStart(query.from);
+    if (query.to) reportedAt.lte = reportRangeEnd(query.to);
 
     const where: Prisma.DelayWhereInput = {
       ...(user.role === 'CLIENT' ? { trip: { clientId: user.userId } } : {}),
@@ -161,10 +166,11 @@ export class DelaysService {
 
       this.bump(byCategory, delay.category, titleCase(delay.category), minutes);
 
-      const driverKey = delay.trip.driverId ?? 'UNASSIGNED';
+      const driverBucket =
+        driverKey(delay.trip.driverId, delay.trip.driverName) ?? 'UNASSIGNED';
       const driverLabel =
         delay.trip.driverName ?? delay.trip.driverId ?? 'Unassigned';
-      this.bump(byDriver, driverKey, driverLabel, minutes);
+      this.bump(byDriver, driverBucket, driverLabel, minutes);
 
       const routeKey = `${delay.trip.origin} → ${delay.trip.destination}`;
       this.bump(byRoute, routeKey, routeKey, minutes);

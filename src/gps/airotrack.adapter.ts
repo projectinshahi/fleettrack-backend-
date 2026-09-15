@@ -3,6 +3,8 @@ import {
   GpsProviderConfig,
   NormalizedPosition,
   NormalizedVehicle,
+  PROVIDER_REQUEST_TIMEOUT_MS,
+  providerRequestError,
 } from './gps-provider.interface';
 
 /**
@@ -31,10 +33,18 @@ export class AiroTrackAdapter implements GpsProvider {
   }
 
   private async fetchRaw(): Promise<unknown[]> {
-    const res = await fetch(this.buildUrl());
-    if (!res.ok) throw new Error(`AiroTrack HTTP ${res.status}`);
-    const json: unknown = await res.json();
-    return Array.isArray(json) ? json : [];
+    // The signal bounds the body read too, not just the headers.
+    const timeoutMs = this.config.timeoutMs ?? PROVIDER_REQUEST_TIMEOUT_MS;
+    try {
+      const res = await fetch(this.buildUrl(), {
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (!res.ok) throw new Error(`AiroTrack HTTP ${res.status}`);
+      const json: unknown = await res.json();
+      return Array.isArray(json) ? json : [];
+    } catch (e) {
+      throw providerRequestError(e, 'AiroTrack', timeoutMs);
+    }
   }
 
   /** Pure mapping of one AiroTrack row → NormalizedPosition (unit-tested). */

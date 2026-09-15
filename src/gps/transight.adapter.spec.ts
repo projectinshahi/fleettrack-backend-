@@ -1,3 +1,6 @@
+import { createServer, type Server } from 'http';
+import type { AddressInfo } from 'net';
+
 import { TransightAdapter } from './transight.adapter';
 
 describe('TransightAdapter', () => {
@@ -261,5 +264,36 @@ describe('TransightAdapter inventory cache + rate limiting', () => {
     expect(positions[0].providerVehicleId).toBe('228085');
     expect(positions[0].identityIsFallback).toBe(false);
     expect(calls.inventory).toBe(2);
+  });
+});
+
+/** Same guarantee for Transight: a stalled endpoint fails the call instead of the tick. */
+describe('TransightAdapter request timeout', () => {
+  let server: Server;
+  let baseUrl: string;
+
+  beforeAll(async () => {
+    server = createServer(() => undefined);
+    await new Promise<void>((resolve) =>
+      server.listen(0, '127.0.0.1', resolve),
+    );
+    baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api/v2`;
+  });
+
+  afterAll(async () => {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  it('gives up after the configured timeout with an error that names the endpoint', async () => {
+    const adapter = new TransightAdapter({
+      baseUrl,
+      credential: 'k',
+      timeoutMs: 150,
+    });
+    // The inventory refresh fails soft; the positions call is the one that must reject.
+    await expect(adapter.getLatestPositions()).rejects.toThrow(
+      'Transight get_all_vehicles_last_data request timed out after 150 ms',
+    );
   });
 });

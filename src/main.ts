@@ -1,6 +1,8 @@
-import { ValidationPipe } from '@nestjs/common';
+import { Logger, ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
+import type { NestExpressApplication } from '@nestjs/platform-express';
 import { AppModule } from './app.module';
+import { scheduledJobsEnabled } from './common/scheduled-jobs';
 
 // Browser origins allowed to call this API. Resolved exactly like the socket gateway's
 // CORS origin and the password-reset link base (same FRONTEND_URL, same trailing-slash
@@ -16,7 +18,10 @@ const ALLOWED_ORIGINS = [
 ];
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  const app = await NestFactory.create<NestExpressApplication>(AppModule);
+
+  // No framework fingerprint on every response.
+  app.disable('x-powered-by');
 
   app.enableCors({
     origin: ALLOWED_ORIGINS,
@@ -34,5 +39,18 @@ async function bootstrap() {
   );
 
   await app.listen(process.env.PORT ?? 5000);
+
+  // State the scheduled-jobs decision in the first log lines, so a production container that
+  // is missing the flag (and therefore not syncing GPS) is obvious at a glance.
+  const logger = new Logger('Bootstrap');
+  if (scheduledJobsEnabled()) {
+    logger.log(
+      'Scheduled jobs ENABLED in this process: GPS provider sync, offline sweep, ETA alert scan',
+    );
+  } else {
+    logger.warn(
+      'Scheduled jobs DISABLED in this process (SCHEDULED_JOBS_ENABLED is not "true"): no GPS provider sync, offline sweep or ETA alert scan runs here',
+    );
+  }
 }
 bootstrap();

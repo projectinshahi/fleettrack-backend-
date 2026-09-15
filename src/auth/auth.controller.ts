@@ -16,14 +16,15 @@ import { AuthService } from './auth.service';
 import { ForgotPasswordDto } from './dto/forgot-password.dto';
 import { VerifyResetTokenDto } from './dto/verify-reset-token.dto';
 import { ResetPasswordDto } from './dto/reset-password.dto';
+import { LoginDto } from './dto/login.dto';
 
 @Controller('auth')
 export class AuthController {
   constructor(private readonly authService: AuthService) {}
 
   @Post('login')
-  login(@Body() body: any) {
-    return this.authService.login(body);
+  login(@Body() dto: LoginDto) {
+    return this.authService.login(dto);
   }
 
   @UseGuards(JwtAuthGuard)

@@ -562,7 +562,7 @@ describe('TripRequestsService.reject', () => {
 /**
  * Harness for the read/delete paths. Separate from makeService() above so the existing
  * approve tests keep their exact mock surface; this one adds the vehicle lookup that
- * withVehicles() performs and the delete the new endpoint needs.
+ * withReferences() performs and the delete the new endpoint needs.
  */
 function makeReadService(opts: any = {}) {
   const prisma: any = {
@@ -946,5 +946,74 @@ describe('trip creation route permissions', () => {
         guardCtx(TripRequestsController.prototype.remove, { role: 'CLIENT' }),
       ),
     ).toBe(true);
+  });
+});
+
+describe('TripRequest reference resolution (customer, reviewer, resulting trip)', () => {
+  it('attaches the customer, reviewer and resulting trip with one batched lookup each', async () => {
+    const prisma: any = {
+      tripRequest: {
+        findMany: jest.fn().mockResolvedValue([
+          {
+            id: 'r1',
+            clientId: 'client-1',
+            vehicleId: null,
+            customerId: 'cus-1',
+            reviewedById: 'admin-1',
+            tripId: 'trip-1',
+          },
+          {
+            id: 'r2',
+            clientId: 'client-1',
+            vehicleId: null,
+            customerId: 'cus-1',
+            reviewedById: null,
+            tripId: null,
+          },
+        ]),
+      },
+      vehicle: { findMany: jest.fn() },
+      customer: {
+        findMany: jest
+          .fn()
+          .mockResolvedValue([{ id: 'cus-1', name: 'Lulu Hypermarket' }]),
+      },
+      user: {
+        findMany: jest
+          .fn()
+          .mockResolvedValue([{ id: 'admin-1', name: 'Fleet Admin' }]),
+      },
+      trip: {
+        findMany: jest
+          .fn()
+          .mockResolvedValue([{ id: 'trip-1', reference: 'TRP-1001' }]),
+      },
+    };
+    const service = new TripRequestsService(prisma, {} as any, {} as any);
+
+    const { requests } = await service.findAll(adminUser);
+
+    expect(requests[0].customer).toEqual({
+      id: 'cus-1',
+      name: 'Lulu Hypermarket',
+    });
+    expect(requests[0].reviewedBy).toEqual({
+      id: 'admin-1',
+      name: 'Fleet Admin',
+    });
+    expect(requests[0].trip).toEqual({ id: 'trip-1', reference: 'TRP-1001' });
+    expect(requests[1].customer).toEqual({
+      id: 'cus-1',
+      name: 'Lulu Hypermarket',
+    });
+    expect(requests[1].reviewedBy).toBeNull();
+    expect(requests[1].trip).toBeNull();
+    expect(prisma.customer.findMany).toHaveBeenCalledTimes(1);
+    expect(prisma.customer.findMany.mock.calls[0][0].where.id.in).toEqual([
+      'cus-1',
+    ]);
+    expect(prisma.user.findMany).toHaveBeenCalledTimes(1);
+    expect(prisma.trip.findMany).toHaveBeenCalledTimes(1);
+    expect(prisma.vehicle.findMany).not.toHaveBeenCalled();
   });
 });

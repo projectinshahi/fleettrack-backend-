@@ -12,6 +12,10 @@ import { CreateAddressDto } from './dto/create-address.dto';
 import { UpdateAddressDto } from './dto/update-address.dto';
 import { CustomerReportQueryDto } from './dto/customer-report-query.dto';
 import {
+  reportRangeEnd,
+  reportRangeStart,
+} from '../common/utils/report-date-range';
+import {
   detectDelay,
   DEFAULT_DELAY_MARGIN_MINUTES,
 } from '../trips/trip-delay.util';
@@ -285,8 +289,8 @@ export class CustomersService {
     query: CustomerReportQueryDto,
   ) {
     const scheduledStart: Prisma.DateTimeFilter = {};
-    if (query.from) scheduledStart.gte = new Date(query.from);
-    if (query.to) scheduledStart.lte = new Date(query.to);
+    if (query.from) scheduledStart.gte = reportRangeStart(query.from);
+    if (query.to) scheduledStart.lte = reportRangeEnd(query.to);
 
     const where: Prisma.TripWhereInput = {
       clientId,

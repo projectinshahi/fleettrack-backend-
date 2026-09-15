@@ -1,17 +1,29 @@
 import {
+  ArrayMaxSize,
   IsArray,
   IsDateString,
   IsNotEmpty,
   IsNumber,
   IsOptional,
   IsString,
+  MaxLength,
   ValidateNested,
 } from 'class-validator';
 import { Type } from 'class-transformer';
 
+/**
+ * Every stop and route address is geocoded server-side, one outbound geocoding request per
+ * unique address, so an unbounded `stops` array or address string was an unbounded fan-out
+ * from a single request. The admin UI caps a trip at 10 stops; 25 leaves headroom for API
+ * callers without being unbounded.
+ */
+export const MAX_TRIP_STOPS = 25;
+export const MAX_ADDRESS_LENGTH = 500;
+
 export class CreateTripStopDto {
   @IsString()
   @IsNotEmpty()
+  @MaxLength(MAX_ADDRESS_LENGTH)
   address: string;
 
   @IsOptional()
@@ -60,14 +72,17 @@ export class CreateTripDto {
 
   @IsString()
   @IsNotEmpty()
+  @MaxLength(MAX_ADDRESS_LENGTH)
   origin: string;
 
   @IsString()
   @IsNotEmpty()
+  @MaxLength(MAX_ADDRESS_LENGTH)
   destination: string;
 
   @IsOptional()
   @IsArray()
+  @ArrayMaxSize(MAX_TRIP_STOPS)
   @ValidateNested({ each: true })
   @Type(() => CreateTripStopDto)
   stops?: CreateTripStopDto[];

@@ -43,11 +43,35 @@ export interface NormalizedPosition extends NormalizedVehicle {
   identityIsFallback?: boolean;
 }
 
+/**
+ * Upper bound on ONE provider HTTP call. Without it, Node's fetch waits up to 300 s for
+ * response headers (undici's default), and the sync polls providers one after another behind
+ * a single reentrancy guard: one stalled provider held the whole tick, so the other provider
+ * was not polled either while the offline sweep kept aging its vehicles out. Reproduced
+ * locally: a bare fetch() to an endpoint that accepts and never answers was still pending
+ * after 65 s. 20 s is far above a healthy call and keeps both providers inside one 60 s tick
+ * even if both time out.
+ */
+export const PROVIDER_REQUEST_TIMEOUT_MS = 20_000;
+
+/** Rewrite a fetch aborted by its timeout into an error naming the provider and the limit. */
+export function providerRequestError(
+  error: unknown,
+  provider: string,
+  timeoutMs: number,
+): unknown {
+  return (error as { name?: string } | null)?.name === 'TimeoutError'
+    ? new Error(`${provider} request timed out after ${timeoutMs} ms`)
+    : error;
+}
+
 export interface GpsProviderConfig {
   baseUrl: string;
   /** token (AiroTrack) or apikey (Transight). Never logged or serialized. */
   credential: string;
   system?: string | null;
+  /** Per-call timeout; PROVIDER_REQUEST_TIMEOUT_MS unless set (only tests set it). */
+  timeoutMs?: number;
 }
 
 export interface GpsProvider {

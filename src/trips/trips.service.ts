@@ -36,6 +36,11 @@ import {
 import { EtaAlertsQueryDto } from './dto/eta-alerts-query.dto';
 import { GeocodingService } from '../geocoding/geocoding.service';
 import { NotificationsService } from '../notifications/notifications.service';
+import {
+  reportRangeEnd,
+  reportRangeStart,
+} from '../common/utils/report-date-range';
+import { driverIdFromName, driverKey } from '../common/utils/driver-key';
 
 type AuthUser = { userId: string; role: string; accountType?: string };
 
@@ -683,8 +688,8 @@ export class TripsService {
    */
   private async buildTripSummary(user: AuthUser, query: TripReportQueryDto) {
     const scheduledStart: Prisma.DateTimeFilter = {};
-    if (query.from) scheduledStart.gte = new Date(query.from);
-    if (query.to) scheduledStart.lte = new Date(query.to);
+    if (query.from) scheduledStart.gte = reportRangeStart(query.from);
+    if (query.to) scheduledStart.lte = reportRangeEnd(query.to);
 
     const where: Prisma.TripWhereInput = {
       ...(user.role === 'CLIENT'
@@ -816,11 +821,13 @@ export class TripsService {
     query: DriverReportQueryDto,
   ) {
     const scheduledStart: Prisma.DateTimeFilter = {};
-    if (query.from) scheduledStart.gte = new Date(query.from);
-    if (query.to) scheduledStart.lte = new Date(query.to);
+    if (query.from) scheduledStart.gte = reportRangeStart(query.from);
+    if (query.to) scheduledStart.lte = reportRangeEnd(query.to);
 
     const where: Prisma.TripWhereInput = {
-      driverId: { not: null },
+      // A driver is an id OR a typed-in name (common/utils/driver-key.ts). Filtering on
+      // driverId alone excluded every trip whose driver was typed in, which today is all.
+      OR: [{ driverId: { not: null } }, { driverName: { not: null } }],
       ...(user.role === 'CLIENT'
         ? { clientId: user.userId }
         : query.clientId
@@ -849,14 +856,16 @@ export class TripsService {
       TripStatus.DELAYED,
     ];
 
-    // Aggregate per driver (keyed by driverId; the where filter guarantees non-null).
+    // Aggregate per driver, keyed by driverId or, for a typed-in driver, the id derived from
+    // the name (the same rule listDrivers issues).
     const byDriver = new Map<string, DriverPerfAccumulator>();
     for (const trip of trips) {
-      if (!trip.driverId) continue;
-      let acc = byDriver.get(trip.driverId);
+      const key = driverKey(trip.driverId, trip.driverName);
+      if (!key) continue;
+      let acc = byDriver.get(key);
       if (!acc) {
         acc = {
-          driverId: trip.driverId,
+          driverId: key,
           driverName: trip.driverName ?? null,
           totalTrips: 0,
           completed: 0,
@@ -868,7 +877,7 @@ export class TripsService {
           durationSum: 0,
           durationCount: 0,
         };
-        byDriver.set(trip.driverId, acc);
+        byDriver.set(key, acc);
       }
       if (!acc.driverName && trip.driverName) acc.driverName = trip.driverName;
 
@@ -1032,8 +1041,8 @@ export class TripsService {
     query: VehicleReportQueryDto,
   ) {
     const scheduledStart: Prisma.DateTimeFilter = {};
-    if (query.from) scheduledStart.gte = new Date(query.from);
-    if (query.to) scheduledStart.lte = new Date(query.to);
+    if (query.from) scheduledStart.gte = reportRangeStart(query.from);
+    if (query.to) scheduledStart.lte = reportRangeEnd(query.to);
 
     const where: Prisma.TripWhereInput = {
       vehicleId: { not: null },
@@ -1074,9 +1083,11 @@ export class TripsService {
       observedEnd = Math.max(observedEnd, trip.scheduledEnd.getTime());
     }
     const windowStart = query.from
-      ? new Date(query.from).getTime()
+      ? reportRangeStart(query.from).getTime()
       : observedStart;
-    const windowEnd = query.to ? new Date(query.to).getTime() : observedEnd;
+    const windowEnd = query.to
+      ? reportRangeEnd(query.to).getTime()
+      : observedEnd;
     const windowMinutes =
       Number.isFinite(windowStart) && Number.isFinite(windowEnd)
         ? Math.max(0, Math.round((windowEnd - windowStart) / 60000))
@@ -1349,8 +1360,8 @@ export class TripsService {
     const byId = new Map<string, { id: string; name: string }>();
     for (const { driverName } of vehicles) {
       const name = driverName?.trim();
-      if (!name) continue;
-      const id = `drv:${name.toLowerCase().replace(/\s+/g, '-')}`;
+      const id = driverIdFromName(name);
+      if (!name || !id) continue;
       if (!byId.has(id)) byId.set(id, { id, name });
     }
 
@@ -2223,6 +2234,9 @@ export class TripsService {
         : null,
       driverId: t.driverId,
       driverName: t.driverName,
+      // Captured at ADMIN create / approval; the trip CSV's "Driver Phone" column read it,
+      // but it was never mapped, so that column was always empty.
+      driverPhone: t.driverPhone ?? null,
       customerId: t.customerId,
       customer: t.customer
         ? { id: t.customer.id, name: t.customer.name }

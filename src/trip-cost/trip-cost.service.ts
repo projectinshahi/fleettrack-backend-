@@ -9,6 +9,10 @@ import { PrismaService } from '../prisma/prisma.service';
 import { UpsertTripCostDto } from './dto/upsert-trip-cost.dto';
 import { CostReportQueryDto } from './dto/cost-report-query.dto';
 import { computeCostVariance, COST_COMPONENTS } from './trip-cost.util';
+import {
+  reportRangeEnd,
+  reportRangeStart,
+} from '../common/utils/report-date-range';
 
 type AuthUser = { userId: string; role: string; accountType?: string };
 
@@ -100,8 +104,8 @@ export class TripCostService {
    */
   private async buildReport(user: AuthUser, query: CostReportQueryDto) {
     const scheduledStart: Prisma.DateTimeFilter = {};
-    if (query.from) scheduledStart.gte = new Date(query.from);
-    if (query.to) scheduledStart.lte = new Date(query.to);
+    if (query.from) scheduledStart.gte = reportRangeStart(query.from);
+    if (query.to) scheduledStart.lte = reportRangeEnd(query.to);
 
     const where: Prisma.TripWhereInput = {
       ...(user.role === 'CLIENT'
