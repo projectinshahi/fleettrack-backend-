@@ -272,6 +272,16 @@ export class DashboardService {
     },
 
     take: 5,
+
+      // Only what the mapping below reads (status + isOnline feed effectiveVehicleStatus).
+      select: {
+        id: true,
+        vehicleNumber: true,
+        driverName: true,
+        speed: true,
+        status: true,
+        isOnline: true,
+      },
   });
 
   const activeVehicles = vehicles.map((vehicle) => ({

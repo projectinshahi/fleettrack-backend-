@@ -509,3 +509,155 @@ describe('TrackingService inventory-first gap-fill', () => {
     expect(store.rows).toHaveLength(1);
   });
 });
+
+/**
+ * Vehicle reads per sync cycle. A provider poll used to look every vehicle up with its own
+ * query (one per position, then one per Transight inventory entry, for rows it had just
+ * written). The cycle now reads the provider's vehicles once and keeps that set in step with
+ * its own writes, so these pin both the read count and that the answers stay the same.
+ */
+describe('TrackingService per-cycle vehicle reads', () => {
+  const airoRow = (i: number) => ({
+    id: `airo-${i}`,
+    vehicleName: `KL84C${7000 + i}`,
+    vehicleNumber: `KL84C${7000 + i}`,
+    gpsDeviceId: `KL84C${7000 + i}`,
+    providerName: 'airotrack',
+    providerVehicleId: `KL84C${7000 + i}`,
+    imei: null,
+    driverName: 'Driver',
+    clientId: i % 2 ? 'client-nesto' : null,
+    status: 'IDLE',
+    isOnline: true,
+    speed: 0,
+    latitude: 11,
+    longitude: 75.9,
+    lastProviderUpdate: new Date(Date.now() - 2 * 60 * 1000),
+    lastSeenAt: new Date(Date.now() - 2 * 60 * 1000),
+  });
+  const airoPos = (i: number): NormalizedPosition => ({
+    providerName: 'airotrack',
+    providerVehicleId: `KL84C${7000 + i}`,
+    vehicleNumber: `KL84C${7000 + i}`,
+    imei: null,
+    gpsDeviceId: `KL84C${7000 + i}`,
+    latitude: 11.01,
+    longitude: 75.91,
+    speed: 20,
+    ignition: true,
+    batteryVoltage: 28,
+    charge: true,
+    providerTimestamp: new Date(),
+  });
+
+  it('H1. an AiroTrack poll reads its vehicles once, not once per position', async () => {
+    const store = makeStore(Array.from({ length: 24 }, (_, i) => airoRow(i)));
+    const positions = Array.from({ length: 24 }, (_, i) => airoPos(i));
+    const made = makeService(store, positions, 'AIROTRACK', 60, [], {
+      withCachedVehicles: false,
+    });
+    const gateway = made.gateway as { emitVehicleUpdate: jest.Mock };
+
+    await made.service.syncVehicles();
+
+    expect(store.vehicle.findFirst).toHaveBeenCalledTimes(0);
+    expect(store.vehicle.findMany).toHaveBeenCalledTimes(1);
+    expect(store.vehicle.findMany).toHaveBeenCalledWith({
+      where: { providerName: 'airotrack' },
+    });
+    // Every vehicle still updated and broadcast, no rows created.
+    expect(store.vehicle.update).toHaveBeenCalledTimes(24);
+    expect(gateway.emitVehicleUpdate).toHaveBeenCalledTimes(24);
+    expect(store.vehicle.create).not.toHaveBeenCalled();
+  });
+
+  it('H2. a Transight poll plus its inventory gap-fill reads its vehicles once', async () => {
+    const rows = Array.from({ length: 20 }, (_, i) => ({
+      ...legitRow(),
+      id: `ts-${i}`,
+      providerVehicleId: String(228000 + i),
+      imei: String(860560066100000 + i),
+    }));
+    const store = makeStore(rows);
+    const positions = rows
+      .slice(0, 18)
+      .map((r) =>
+        transightPos({ providerVehicleId: r.providerVehicleId, imei: r.imei }),
+      );
+    const inventory = rows.map((r) => ({
+      providerName: 'transight' as const,
+      providerVehicleId: r.providerVehicleId,
+      vehicleNumber: r.vehicleNumber,
+      imei: r.imei,
+      gpsDeviceId: r.imei,
+    }));
+    const { service } = makeService(
+      store,
+      positions,
+      'TRANSIGHT',
+      300,
+      inventory,
+    );
+
+    await service.syncVehicles();
+
+    expect(store.vehicle.findFirst).toHaveBeenCalledTimes(0);
+    expect(store.vehicle.findMany).toHaveBeenCalledTimes(1);
+    expect(store.vehicle.update).toHaveBeenCalledTimes(18);
+    expect(store.vehicle.create).not.toHaveBeenCalled();
+  });
+
+  it('H3. a vehicle listed twice in one response is created once, then updated', async () => {
+    const store = makeStore([]);
+    const first = transightPos({ speed: 5 });
+    const second = transightPos({ speed: 40, providerTimestamp: new Date() });
+    const { service } = makeService(store, [first, second]);
+
+    await service.syncVehicles();
+
+    expect(store.rows).toHaveLength(1);
+    expect(store.vehicle.create).toHaveBeenCalledTimes(1);
+    expect(store.vehicle.update).toHaveBeenCalledTimes(1);
+    expect(store.rows[0]).toMatchObject({ speed: 40 });
+  });
+
+  it('H4. a re-key made in the cycle is what the rest of the cycle sees', async () => {
+    // Legacy row keyed by IMEI; the position arrives keyed by the real vehicle_id.
+    const store = makeStore([
+      { ...legitRow(), providerVehicleId: '860560066144082' },
+    ]);
+    const { service } = makeService(store, [transightPos()], 'TRANSIGHT', 300, [
+      {
+        providerName: 'transight',
+        providerVehicleId: '228068',
+        vehicleNumber: 'KL84D1577',
+        imei: '860560066144082',
+        gpsDeviceId: '860560066144082',
+      },
+    ]);
+
+    await service.syncVehicles();
+
+    // One IMEI lookup (the position's), none for the inventory entry: it finds the
+    // re-keyed row in the cycle's set.
+    expect(store.vehicle.findFirst).toHaveBeenCalledTimes(1);
+    expect(store.vehicle.create).not.toHaveBeenCalled();
+    expect(store.rows).toHaveLength(1);
+    expect(store.rows[0]).toMatchObject({
+      providerVehicleId: '228068',
+      clientId: 'client-nesto',
+    });
+  });
+
+  it('H5. the set lasts one cycle only — the next tick reads the table again', async () => {
+    const store = makeStore([airoRow(1)]);
+    const { service } = makeService(store, [airoPos(1)], 'AIROTRACK', 60, [], {
+      withCachedVehicles: false,
+    });
+
+    await service.syncVehicles();
+    await service.syncVehicles();
+
+    expect(store.vehicle.findMany).toHaveBeenCalledTimes(2);
+  });
+});

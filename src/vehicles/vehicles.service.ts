@@ -82,6 +82,8 @@ export class VehiclesService {
       where: {
         id,
       },
+      // Existence + the ownership check are all this reads; the response is history only.
+      select: { clientId: true },
     });
 
     if (!vehicle) {

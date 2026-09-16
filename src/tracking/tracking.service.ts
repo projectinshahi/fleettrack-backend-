@@ -89,6 +89,13 @@ export class TrackingService {
   // trip queries — exactly as before.
   private activeTripsByVehicle: Map<string, string[]> | null = null;
 
+  // Each provider's vehicles keyed by providerVehicleId, valid for ONE sync cycle only
+  // (cleared in the same `finally`). Identity resolution used to query the Vehicle table
+  // once per position and again once per Transight inventory entry — for rows the same
+  // cycle had just written. Loaded on the first lookup for a provider and kept in step with
+  // every vehicle write the cycle makes, so each lookup sees what a fresh query would.
+  private vehiclesByProvider: Map<string, Map<string, Vehicle>> | null = null;
+
   constructor(
     private prisma: PrismaService,
     private trackingGateway: TrackingGateway,
@@ -241,9 +248,10 @@ export class TrackingService {
       );
     } finally {
       this.isSyncing = false;
-      // End of the sync cycle — drop the per-cycle active-trip snapshot so the next
-      // tick reloads it and never acts on a stale trip set.
+      // End of the sync cycle — drop the per-cycle snapshots so the next tick reloads
+      // them and never acts on a stale trip or vehicle set.
       this.activeTripsByVehicle = null;
+      this.vehiclesByProvider = null;
     }
   }
 
@@ -263,11 +271,15 @@ export class TrackingService {
    * because clientId is NULL for synced inventory (Postgres treats NULLs as distinct), and
    * @@unique([providerName, providerVehicleId]) is inert precisely when two rows are keyed
    * by different identities for the same device.
+   *
+   * The provider-id lookup reads the cycle's vehicle set (see vehiclesByProvider); that key
+   * is unique, so the set gives the same answer the per-lookup query did. The IMEI fallback
+   * is rare and still queries the table directly.
    */
   private async findExistingVehicle(v: NormalizedVehicle) {
-    const byProviderId = await this.prisma.vehicle.findFirst({
-      where: { providerName: v.providerName, providerVehicleId: v.providerVehicleId },
-    });
+    const byProviderId =
+      (await this.providerVehicles(v.providerName)).get(v.providerVehicleId) ??
+      null;
     if (byProviderId || !v.imei) return byProviderId;
 
     const byImei = await this.prisma.vehicle.findFirst({
@@ -280,10 +292,44 @@ export class TrackingService {
         `providerVehicleId=${byImei.providerVehicleId} to ${v.providerVehicleId} ` +
         `via IMEI — same device, avoided a duplicate row`,
     );
-    return this.prisma.vehicle.update({
+    const rekeyed = await this.prisma.vehicle.update({
       where: { id: byImei.id },
       data: { providerVehicleId: v.providerVehicleId },
     });
+    this.rememberVehicle(rekeyed, byImei.providerVehicleId);
+    return rekeyed;
+  }
+
+  /** One provider's vehicles for this cycle — a single read the first time it is needed. */
+  private async providerVehicles(
+    providerName: string,
+  ): Promise<Map<string, Vehicle>> {
+    this.vehiclesByProvider ??= new Map();
+    let byId = this.vehiclesByProvider.get(providerName);
+    if (!byId) {
+      const rows = await this.prisma.vehicle.findMany({
+        where: { providerName },
+      });
+      byId = new Map();
+      for (const row of rows) {
+        if (row.providerVehicleId) byId.set(row.providerVehicleId, row);
+      }
+      this.vehiclesByProvider.set(providerName, byId);
+    }
+    return byId;
+  }
+
+  /**
+   * Keep the cycle's vehicle set in step with a row this cycle just wrote. `replacedKey` is
+   * the provider id a re-key moved the row away from, which must stop matching.
+   */
+  private rememberVehicle(row: Vehicle, replacedKey?: string | null): void {
+    const byId = row.providerName
+      ? this.vehiclesByProvider?.get(row.providerName)
+      : undefined;
+    if (!byId) return;
+    if (replacedKey) byId.delete(replacedKey);
+    if (row.providerVehicleId) byId.set(row.providerVehicleId, row);
   }
 
   /**
@@ -310,7 +356,7 @@ export class TrackingService {
     for (const v of provider.cachedVehicles?.() ?? []) {
       if (await this.findExistingVehicle(v)) continue;
 
-      await this.prisma.vehicle.create({
+      const row = await this.prisma.vehicle.create({
         data: {
           vehicleName: v.vehicleNumber,
           vehicleNumber: v.vehicleNumber,
@@ -334,6 +380,7 @@ export class TrackingService {
           lastSeenAt: null,
         },
       });
+      this.rememberVehicle(row);
       created++;
 
       this.logger.log(
@@ -422,6 +469,7 @@ export class TrackingService {
           lastProviderUpdate: fixTime,
         },
       });
+      this.rememberVehicle(created);
 
       this.logger.log(
         `New unassigned inventory vehicle ${pos.vehicleNumber} (${pos.providerName})`,
@@ -441,10 +489,12 @@ export class TrackingService {
       fixTime.getTime() < existing.lastProviderUpdate.getTime();
 
     if (isStaleReplay) {
-      await this.prisma.vehicle.update({
-        where: { id: existing.id },
-        data: { lastSeenAt: new Date() },
-      });
+      this.rememberVehicle(
+        await this.prisma.vehicle.update({
+          where: { id: existing.id },
+          data: { lastSeenAt: new Date() },
+        }),
+      );
       return outcome;
     }
 
@@ -468,6 +518,7 @@ export class TrackingService {
         lastProviderUpdate: fixTime ?? undefined,
       },
     });
+    this.rememberVehicle(updated);
 
     await this.recordHistoryAndBreadcrumbs(updated, pos);
 
@@ -490,6 +541,8 @@ export class TrackingService {
     const lastHistory = await this.prisma.vehicleLocationHistory.findFirst({
       where: { vehicleId: vehicle.id },
       orderBy: { createdAt: 'desc' },
+      // Only the point is compared; the other six columns were read and discarded.
+      select: { latitude: true, longitude: true },
     });
 
     let shouldSave = true;
